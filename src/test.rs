@@ -110,7 +110,7 @@ impl IndexableField for Id {
     }
 
     fn encode(&self, buf: &mut SmallVec<[u8; 128]>) -> Result<()> {
-        Ok(buf.copy_from_slice(self.0.as_bytes()))
+        Ok(buf.extend_from_slice(self.0.as_bytes()))
     }
 }
 
@@ -227,8 +227,11 @@ impl Model {
 	    by_index: BTreeMap::new(),
 	    by_id: BTreeMap::new(),
 	};
-	for i in 0..n {
+	for _ in 0..n {
 	    model.records.push(TestRec::gen());
+	}
+	model.records.sort_by_key(|r| r.timestamp());
+	for i in 0..n {
 	    match &model.records[i] {
 		TestRec::Foo(f) => {
 		    model.by_time.insert(f.time, i);
@@ -251,24 +254,36 @@ static N: AtomicUsize = AtomicUsize::new(0);
 async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
     let name = format!("test-data{}", N.fetch_add(1, MemOrdering::Relaxed));
     let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(&name);
-    std::fs::remove_dir_all(&dir)?;
+    if dir.exists() {
+	std::fs::remove_dir_all(&dir)?;
+    }
     std::fs::create_dir_all(&dir)?;
     let db = IndexedJson::new(&dir).await?;
     let model = Model::generate(n);
     Ok((db, model))
 }
 
-#[tokio::test]
-async fn test_append_get() {
-    let (mut db, model) = init(5).await.unwrap();
+async fn test_append_get_n(n: usize) {
+    let (mut db, model) = init(n).await.unwrap();
     for r in model.records.iter() {
 	db.append(r).await.unwrap()
     }
+    db.flush().await.unwrap();
     let mut i = db.first().unwrap();
-    for j in 0..5 {
+    for j in 0..n {
 	let (new_i, t) = db.get(i).await.unwrap().unwrap();
 	assert_eq!(&t, &model.records[j]);
 	i = new_i;
     }
     assert_eq!(None, db.get(i).await.unwrap())
+}
+
+#[tokio::test]
+async fn test_append_get_small() {
+    test_append_get_n(10).await
+}
+
+#[tokio::test]
+async fn test_append_get_large() {
+    test_append_get_n(1000000).await
 }

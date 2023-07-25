@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use bytes::Buf;
 use chrono::{DateTime, NaiveDate, Utc};
 use compact_str::CompactString;
+use fxhash::FxHashMap;
 use immutable_chunkmap::set::SetM as Set;
 use log::{error, warn};
 use netidx_core::pack::Pack;
@@ -14,7 +15,7 @@ use sled::IVec;
 use smallvec::SmallVec;
 use std::{
     cmp::{max, Ordering},
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     io::SeekFrom,
     marker::PhantomData,
@@ -75,6 +76,16 @@ pub trait Indexable {
 
     /// return the timestamp of this record
     fn timestamp(&self) -> DateTime<Utc>;
+}
+
+fn min_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
+    let mut iter = index.scan_prefix(k);
+    Ok(iter.next().transpose()?.map(|(k, _)| k))
+}
+
+fn max_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
+    let mut iter = index.scan_prefix(k);
+    Ok(iter.next_back().transpose()?.map(|(k, _)| k))
 }
 
 #[derive(Debug, Clone, Copy, Pack, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,7 +153,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
         let mut pos = 0;
         loop {
             if pos >= buf.len() {
-                buf.resize(max(1024, pos << 1), 0u8);
+                buf.resize(max(128, pos << 1), 0u8);
             }
             let count = file.read(&mut buf[pos..]).await?;
             if count == 0 {
@@ -151,7 +162,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
             }
             for i in pos..pos + count {
                 if buf[i] == b'\n' {
-                    buf.resize(pos + i + 1, 0);
+                    buf.resize(i + 1, 0);
                     return Ok(());
                 }
             }
@@ -171,6 +182,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
             Ok(None)
         } else {
             let new_pos = pos + self.buf.len() as u64;
+            self.buf.pop(); // take out the newline
             Ok(Some((new_pos, serde_json::from_slice(&self.buf[..])?)))
         }
     }
@@ -214,8 +226,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
 pub struct IndexedJson<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     phantom: PhantomData<T>,
     base: PathBuf,
-    index: sled::Db,
+    db: sled::Db,
     index_status: sled::Tree,
+    trees: FxHashMap<CompactString, sled::Tree>,
     files: BTreeMap<NaiveDate, JsonFile<T>>,
     gc: DateTime<Utc>,
 }
@@ -228,22 +241,29 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         if !fs::metadata(&base).await?.is_dir() {
             bail!("{:?} is not a directory", base.as_ref())
         }
-        let index = task::spawn_blocking({
+        let db = task::spawn_blocking({
             let path = base.as_ref().join("db");
-            move || sled::open(path)
+            move || {
+                sled::Config::new()
+                    .mode(sled::Mode::LowSpace)
+                    .flush_every_ms(None)
+                    .path(path)
+                    .open()
+            }
         })
         .await??;
         let index_status = task::spawn_blocking({
-            let index = index.clone();
-            move || index.open_tree("index_status")
+            let db = db.clone();
+            move || db.open_tree("status")
         })
         .await??;
         let files = BTreeMap::new();
         let mut t = Self {
             phantom: PhantomData,
             base: PathBuf::from(base.as_ref()),
-            index,
+            db,
             index_status,
+            trees: HashMap::default(),
             files,
             gc: Utc::now(),
         };
@@ -254,6 +274,14 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     // note this will close all open files as well as add any new
     // files that have appeared on disk to the database.
     async fn rescan_files(&mut self) -> Result<()> {
+        self.trees.clear();
+        for name in self.db.tree_names() {
+            if name.starts_with(b"index_") {
+                let tree = self.db.open_tree(&name)?;
+                self.trees
+                    .insert(CompactString::from_utf8_lossy(&*name), tree);
+            }
+        }
         self.files.clear();
         let mut dir = fs::read_dir(&self.base).await?;
         loop {
@@ -325,7 +353,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
 
     /// force rebuild the index
     pub async fn reindex(&mut self) -> Result<()> {
-        self.index.clear()?;
+        for (_, tree) in self.trees.drain() {
+            tree.clear()?
+        }
         self.index_status.clear()?;
         self.rescan_files().await?;
         for (file, f) in self.files.iter_mut() {
@@ -337,7 +367,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                             file: *file,
                             offset: pos,
                         };
-                        Self::index_record(&*self.index, entry, &t)?;
+                        Self::index_record(&self.db, &mut self.trees, entry, &t)?;
                         pos = next_pos;
                     }
                     Ok(None) => break,
@@ -352,34 +382,40 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         Ok(())
     }
 
-    // index format in btree     {key}/{value}/{i}     => {IndexEntry}
-    // every index has count key {key}/{value}/"count" => {count}
-    fn index_record<'a>(index: &sled::Tree, pos: IndexEntry, record: &'a T) -> Result<()> {
+    // index format in btree {value}/{i} => {IndexEntry}
+    // where i is the number of times the same value
+    // appears in the index. Each key is stored in a separate
+    // sled tree according to it's name
+    fn index_record<'a>(
+        db: &sled::Db,
+        trees: &mut FxHashMap<CompactString, sled::Tree>,
+        pos: IndexEntry,
+        record: &'a T,
+    ) -> Result<()> {
         let mut kbuf: SmallVec<[u8; 128]> = SmallVec::new();
         let mut vbuf: SmallVec<[u8; 16]> = SmallVec::new();
         vbuf.resize(pos.encoded_len(), 0u8);
         pos.encode(&mut &mut *vbuf)?;
         for field in record.index() {
-            kbuf.clear();
-            kbuf.extend_from_slice(field.key().as_bytes());
-            kbuf.push(b'/');
-            field.encode(&mut kbuf)?;
-            kbuf.push(b'/');
-            kbuf.extend_from_slice(b"count");
-            let i = match index.get(&*kbuf)? {
-                Some(ibuf) if ibuf.len() == 4 => {
-                    let i = (&mut &*ibuf).get_u32();
-                    index.insert(&*kbuf, &u32::to_be_bytes(i + 1))?;
-                    i
-                }
-                Some(_) | None => {
-                    index.insert(&*kbuf, &u32::to_be_bytes(1))?;
-                    0
+            let tree = match trees.get(field.key()) {
+                Some(t) => t,
+                None => {
+                    let tree = db.open_tree(format!("index_{}", field.key()))?;
+                    trees
+                        .entry(CompactString::from(field.key()))
+                        .or_insert(tree)
                 }
             };
-            kbuf.truncate(kbuf.len() - 5);
-            kbuf.extend_from_slice(&u32::to_be_bytes(i));
-            index.insert(&kbuf[..], &vbuf[..])?;
+            kbuf.clear();
+            field.encode(&mut kbuf)?;
+            kbuf.push(b'/');
+            let count = match max_key_with_prefix(tree, &kbuf)? {
+                None => 0,
+                Some(k) if k.len() < 8 => 0,
+                Some(k) => (&mut &k[k.len() - 8..]).get_u64() + 1,
+            };
+            kbuf.extend_from_slice(&u64::to_be_bytes(count));
+            tree.insert(&kbuf[..], &vbuf[..])?;
         }
         Ok::<_, anyhow::Error>(())
     }
@@ -394,6 +430,16 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
     }
 
+    /// flush the index database
+    pub async fn flush(&mut self) -> Result<()> {
+        for tree in self.trees.values() {
+            tree.flush_async().await?;
+        }
+        self.db.flush_async().await?;
+        self.index_status.flush_async().await?;
+        Ok(())
+    }
+
     /// append the record to the end of the file corresponding to it's
     /// timestamp and then index it.
     pub async fn append(&mut self, record: &T) -> Result<()> {
@@ -404,7 +450,8 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             .or_insert_with(|| JsonFile::new(&self.base, name));
         let pos = file.append(record).await?;
         Self::index_record(
-            &self.index,
+            &self.db,
+            &mut self.trees,
             IndexEntry {
                 file: name,
                 offset: pos,
@@ -456,19 +503,11 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// execute the specified query against the index and return the
     /// set of matching entries.
     pub fn query(&self, query: &Query) -> Result<Set<IndexEntry>> {
-        fn field_kv(field: &Box<dyn IndexableField>) -> Result<SmallVec<[u8; 128]>> {
+        fn field_k(field: &Box<dyn IndexableField>) -> Result<SmallVec<[u8; 128]>> {
             let mut buf = SmallVec::new();
-            buf.extend_from_slice(field.key().as_bytes());
-            buf.push(b'/');
             field.encode(&mut buf)?;
             buf.push(b'/');
             Ok(buf)
-        }
-        fn field_k(field: &Box<dyn IndexableField>) -> SmallVec<[u8; 128]> {
-            let mut buf = SmallVec::new();
-            buf.extend_from_slice(field.key().as_bytes());
-            buf.push(b'/');
-            buf
         }
         fn insert(set: &mut Set<IndexEntry>, k: &[u8], mut v: &[u8]) {
             match IndexEntry::decode(&mut v) {
@@ -480,138 +519,132 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                 }
             }
         }
-        fn min_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
-            let mut iter = index.scan_prefix(k);
-            Ok(iter.next().transpose()?.map(|(k, _)| k))
-        }
-        fn max_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
-            let mut iter = index.scan_prefix(k);
-            Ok(iter.next_back().transpose()?.map(|(k, _)| k))
-        }
         fn gt_gte(
-            index: &sled::Tree,
+            trees: &FxHashMap<CompactString, sled::Tree>,
             field: &Box<dyn IndexableField>,
             gte: bool,
         ) -> Result<Set<IndexEntry>> {
-            let mut set = Set::new();
-            if field.byte_compareable() {
-                let kv = field_kv(field)?;
-                let key = field_k(field);
-                let min = match min_key_with_prefix(index, &kv)? {
-                    Some(k) => k,
-                    None => match min_key_with_prefix(index, &key)? {
-                        Some(k) => k,
-                        None => return Ok(set),
-                    },
-                };
-                let max = match max_key_with_prefix(index, &key)? {
-                    Some(k) => k,
-                    None => return Ok(set),
-                };
-                for r in index.range(&min[..]..=&max[..]) {
-                    let (k, v) = r?;
-                    let k = &k[0..kv.len()];
-                    if !k.ends_with(b"count") && ((gte && k >= &kv[..]) || k > &kv[..]) {
-                        insert(&mut set, &*k, &*v)
-                    }
-                }
-            } else {
-                let key = field_k(field);
-                for r in index.scan_prefix(&key[..]) {
-                    let (k, v) = r?;
-                    if !k.ends_with(b"count") {
-                        match field.decode_cmp(&k[key.len()..k.len() - 4])? {
-                            Ordering::Greater => insert(&mut set, &*k, &*v),
-                            Ordering::Equal if gte => insert(&mut set, &*k, &*v),
-                            Ordering::Equal | Ordering::Less => (),
+            match trees.get(field.key()) {
+                None => Ok(Set::new()),
+                Some(tree) => {
+                    let mut set = Set::new();
+                    let key = field_k(field)?;
+                    if field.byte_compareable() {
+                        let min = match min_key_with_prefix(tree, &key[..])? {
+                            Some(k) => k,
+                            None => match tree.first()? {
+                                Some((k, _)) => k,
+                                None => return Ok(set),
+                            },
+                        };
+                        for r in tree.range(&min[..]..) {
+                            let (k, v) = r?;
+                            let k = &k[0..key.len()];
+                            if (gte && k >= &key[..]) || k > &key[..] {
+                                insert(&mut set, &*k, &*v)
+                            }
+                        }
+                    } else {
+                        for r in tree.iter() {
+                            let (k, v) = r?;
+                            match field.decode_cmp(&k[..key.len() - 1])? {
+                                Ordering::Greater => insert(&mut set, &*k, &*v),
+                                Ordering::Equal if gte => insert(&mut set, &*k, &*v),
+                                Ordering::Equal | Ordering::Less => (),
+                            }
                         }
                     }
+                    Ok(set)
                 }
             }
-            Ok(set)
         }
         fn lt_lte(
-            index: &sled::Tree,
+            trees: &FxHashMap<CompactString, sled::Tree>,
             field: &Box<dyn IndexableField>,
             lte: bool,
         ) -> Result<Set<IndexEntry>> {
-            let mut set = Set::new();
-            if field.byte_compareable() {
-                let kv = field_kv(field)?;
-                let key = field_k(field);
-                let min = match min_key_with_prefix(index, &key)? {
-                    Some(k) => k,
-                    None => return Ok(set),
-                };
-                let max = match max_key_with_prefix(index, &kv)? {
-                    Some(k) => k,
-                    None => match max_key_with_prefix(index, &key)? {
-                        Some(k) => k,
-                        None => return Ok(set),
-                    },
-                };
-                for r in index.range(&min[..]..=&max[..]) {
-                    let (k, v) = r?;
-                    let k = &k[0..kv.len()];
-                    if !k.ends_with(b"count") && ((lte && k <= &kv[..]) || k < &kv[..]) {
-                        insert(&mut set, &*k, &*v)
-                    }
-                }
-            } else {
-                let key = field_k(field);
-                for r in index.scan_prefix(&key[..]) {
-                    let (k, v) = r?;
-                    if !k.ends_with(b"count") {
-                        match field.decode_cmp(&k[key.len()..k.len() - 4])? {
-                            Ordering::Less => insert(&mut set, &*k, &*v),
-                            Ordering::Equal if lte => insert(&mut set, &*k, &*v),
-                            Ordering::Equal | Ordering::Greater => (),
+            match trees.get(field.key()) {
+                None => Ok(Set::new()),
+                Some(tree) => {
+                    let key = field_k(field)?;
+                    let mut set = Set::new();
+                    if field.byte_compareable() {
+                        let max = match max_key_with_prefix(tree, &key)? {
+                            Some(k) => k,
+                            None => match tree.last()? {
+                                Some((k, _)) => k,
+                                None => return Ok(set),
+                            },
+                        };
+                        for r in tree.range(..=&max[..]) {
+                            let (k, v) = r?;
+                            let k = &k[0..key.len()];
+                            if (lte && k <= &key[..]) || k < &key[..] {
+                                insert(&mut set, &*k, &*v)
+                            }
+                        }
+                    } else {
+                        for r in tree.iter() {
+                            let (k, v) = r?;
+                            match field.decode_cmp(&k[..key.len() - 1])? {
+                                Ordering::Less => insert(&mut set, &*k, &*v),
+                                Ordering::Equal if lte => insert(&mut set, &*k, &*v),
+                                Ordering::Equal | Ordering::Greater => (),
+                            }
                         }
                     }
+                    Ok(set)
                 }
             }
-            Ok(set)
         }
-        fn eq(index: &sled::Tree, field: &Box<dyn IndexableField>) -> Result<Set<IndexEntry>> {
-            let mut set = Set::new();
-            for r in index.scan_prefix(&field_kv(field)?) {
-                let (k, v) = r?;
-                if !k.ends_with(b"count") {
-                    insert(&mut set, &*k, &*v)
-                }
-            }
-            Ok(set)
-        }
-        fn all_for_key(
-            index: &sled::Tree,
+        fn eq(
+            trees: &FxHashMap<CompactString, sled::Tree>,
             field: &Box<dyn IndexableField>,
         ) -> Result<Set<IndexEntry>> {
             let mut set = Set::new();
-            let key = field_k(field);
-            for r in index.scan_prefix(&key[..]) {
-                let (k, v) = r?;
-                if !k.ends_with(b"count") {
-                    insert(&mut set, &*k, &*v)
+            match trees.get(field.key()) {
+                None => Ok(Set::new()),
+                Some(tree) => {
+                    for r in tree.scan_prefix(&field_k(field)?) {
+                        let (k, v) = r?;
+                        insert(&mut set, &*k, &*v)
+                    }
+                    Ok(set)
                 }
             }
-            Ok(set)
         }
-        fn all(index: &sled::Tree) -> Result<Set<IndexEntry>> {
+        fn all_for_key(
+            trees: &FxHashMap<CompactString, sled::Tree>,
+            field: &Box<dyn IndexableField>,
+        ) -> Result<Set<IndexEntry>> {
+            match trees.get(field.key()) {
+                None => Ok(Set::new()),
+                Some(tree) => {
+                    let mut set = Set::new();
+                    for r in tree.iter() {
+                        let (k, v) = r?;
+                        insert(&mut set, &*k, &*v)
+                    }
+                    Ok(set)
+                }
+            }
+        }
+        fn all(trees: &FxHashMap<CompactString, sled::Tree>) -> Result<Set<IndexEntry>> {
             let mut set = Set::new();
-            for r in index.iter() {
-                let (k, v) = r?;
-                if !k.ends_with(b"count") {
+            for tree in trees.values() {
+                for r in tree.iter() {
+                    let (k, v) = r?;
                     insert(&mut set, &*k, &*v)
                 }
             }
             Ok(set)
         }
         match query {
-            Query::Eq(field) => eq(&self.index, field),
-            Query::Gt(field) => gt_gte(&self.index, field, false),
-            Query::Gte(field) => gt_gte(&self.index, field, true),
-            Query::Lt(field) => lt_lte(&self.index, field, false),
-            Query::Lte(field) => lt_lte(&self.index, field, true),
+            Query::Eq(field) => eq(&self.trees, field),
+            Query::Gt(field) => gt_gte(&self.trees, field, false),
+            Query::Gte(field) => gt_gte(&self.trees, field, true),
+            Query::Lt(field) => lt_lte(&self.trees, field, false),
+            Query::Lte(field) => lt_lte(&self.trees, field, true),
             Query::And(qs) => Ok(qs
                 .iter()
                 .map(|q| self.query(q))
@@ -630,17 +663,17 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                 .fold(Set::new(), |acc, s| acc.union(&s))),
             Query::Not(q) => match &**q {
                 Query::Eq(field) => {
-                    let matches = eq(&self.index, field)?;
-                    let all = all_for_key(&self.index, field)?;
+                    let matches = eq(&self.trees, field)?;
+                    let all = all_for_key(&self.trees, field)?;
                     Ok(all.diff(&matches))
                 }
-                Query::Gt(field) => lt_lte(&self.index, field, true),
-                Query::Gte(field) => lt_lte(&self.index, field, false),
-                Query::Lt(field) => gt_gte(&self.index, field, true),
-                Query::Lte(field) => gt_gte(&self.index, field, false),
+                Query::Gt(field) => lt_lte(&self.trees, field, true),
+                Query::Gte(field) => lt_lte(&self.trees, field, false),
+                Query::Lt(field) => gt_gte(&self.trees, field, true),
+                Query::Lte(field) => gt_gte(&self.trees, field, false),
                 q @ Query::And(_) | q @ Query::Or(_) | q @ Query::Not(_) => {
                     let matches = self.query(q)?;
-                    Ok(all(&self.index)?.diff(&matches))
+                    Ok(all(&self.trees)?.diff(&matches))
                 }
             },
         }
