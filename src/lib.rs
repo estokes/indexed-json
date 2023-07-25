@@ -23,7 +23,7 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     result,
-    time::UNIX_EPOCH,
+    time::UNIX_EPOCH, any::Any,
 };
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -49,7 +49,7 @@ pub enum Query {
 /// An indexable field. Indexable fields must be byte equal, meaning
 /// the decoded representation will be equal if the encoded bytes are
 /// equal. They may or may not be byte comparable.
-pub trait IndexableField: Debug + Send + 'static {
+pub trait IndexableField: Debug + Send + Any {
     /// return the database key that should be used for this field
     fn key(&self) -> &'static str;
 
@@ -68,6 +68,11 @@ pub trait IndexableField: Debug + Send + 'static {
         self.encode(&mut buf)?;
         Ok(b.cmp(&buf[..]))
     }
+
+    /// return a downcastable object to recover the original type of
+    /// the indexable value in a query. This is a work around until
+    /// trait upcasting is stabilized.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// An indexable type

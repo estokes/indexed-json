@@ -1,7 +1,10 @@
 use super::*;
 use rand::{thread_rng, Rng};
 use serde_derive::{Deserialize, Serialize};
-use std::{ops::Deref, sync::atomic::{AtomicUsize, Ordering as MemOrdering}};
+use std::{
+    ops::Deref,
+    sync::atomic::{AtomicUsize, Ordering as MemOrdering},
+};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
@@ -26,6 +29,10 @@ impl IndexableField for Count {
 
     fn encode(&self, buf: &mut SmallVec<[u8; 128]>) -> Result<()> {
         Ok(buf.extend_from_slice(&u64::to_be_bytes(self.0)))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
     }
 }
 
@@ -52,6 +59,10 @@ impl IndexableField for Index {
 
     fn encode(&self, buf: &mut SmallVec<[u8; 128]>) -> Result<()> {
         Ok(buf.extend_from_slice(&u64::to_be_bytes(self.0)))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
     }
 }
 
@@ -86,6 +97,10 @@ impl IndexableField for Time {
         let a: DateTime<Utc> = Pack::decode(&mut b)?;
         Ok(self.0.cmp(&a))
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,6 +126,10 @@ impl IndexableField for Id {
 
     fn encode(&self, buf: &mut SmallVec<[u8; 128]>) -> Result<()> {
         Ok(buf.extend_from_slice(self.0.as_bytes()))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
     }
 }
 
@@ -212,39 +231,188 @@ impl Indexable for TestRec {
 
 struct Model {
     records: Vec<TestRec>,
-    by_time: BTreeMap<Time, usize>,
-    by_count: BTreeMap<Count, usize>,
-    by_index: BTreeMap<Index, usize>,
-    by_id: BTreeMap<Id, usize>,
+    by_time: BTreeMap<Time, Set<usize>>,
+    by_count: BTreeMap<Count, Set<usize>>,
+    by_index: BTreeMap<Index, Set<usize>>,
+    by_id: BTreeMap<Id, Set<usize>>,
 }
 
 impl Model {
+    fn eq(&self, field: &Box<dyn IndexableField>) -> Set<usize> {
+        let mut res = Set::new();
+        if let Some(time) = field.as_any().downcast_ref::<Time>() {
+            res = self.by_time.get(time).cloned().unwrap_or(Set::new());
+        }
+        if let Some(count) = field.as_any().downcast_ref::<Count>() {
+            res = self.by_count.get(count).cloned().unwrap_or(Set::new());
+        }
+        if let Some(index) = field.as_any().downcast_ref::<Index>() {
+            res = self.by_index.get(index).cloned().unwrap_or(Set::new());
+        }
+        if let Some(id) = field.as_any().downcast_ref::<Id>() {
+            res = self.by_id.get(id).cloned().unwrap_or(Set::new());
+        }
+        res
+    }
+
+    fn gt_gte(&self, gte: bool, field: &Box<dyn IndexableField>) -> Set<usize> {
+        fn gt_gte<T: Ord + Eq>(tbl: &BTreeMap<T, Set<usize>>, gte: bool, t: &T) -> Set<usize> {
+            let mut res = Set::new();
+            for (k, v) in tbl.range(t..) {
+                if (gte && t == k) || k > t {
+                    res = res.union(v);
+                }
+            }
+            res
+        }
+        let mut res = Set::new();
+        if let Some(time) = field.as_any().downcast_ref::<Time>() {
+            res = gt_gte(&self.by_time, gte, time);
+        }
+        if let Some(count) = field.as_any().downcast_ref::<Count>() {
+            res = gt_gte(&self.by_count, gte, count);
+        }
+        if let Some(index) = field.as_any().downcast_ref::<Index>() {
+            res = gt_gte(&self.by_index, gte, index);
+        }
+        if let Some(id) = field.as_any().downcast_ref::<Id>() {
+            res = gt_gte(&self.by_id, gte, id);
+        }
+        res
+    }
+
+    fn lt_lte(&self, lte: bool, field: &Box<dyn IndexableField>) -> Set<usize> {
+        fn lt_lte<T: Ord + Eq>(tbl: &BTreeMap<T, Set<usize>>, lte: bool, t: &T) -> Set<usize> {
+            let mut res = Set::new();
+            for (k, v) in tbl.range(..=t) {
+                if (lte && t == k) || k < t {
+                    res = res.union(v);
+                }
+            }
+            res
+        }
+        let mut res = Set::new();
+        if let Some(time) = field.as_any().downcast_ref::<Time>() {
+            res = lt_lte(&self.by_time, lte, time);
+        }
+        if let Some(count) = field.as_any().downcast_ref::<Count>() {
+            res = lt_lte(&self.by_count, lte, count);
+        }
+        if let Some(index) = field.as_any().downcast_ref::<Index>() {
+            res = lt_lte(&self.by_index, lte, index);
+        }
+        if let Some(id) = field.as_any().downcast_ref::<Id>() {
+            res = lt_lte(&self.by_id, lte, id);
+        }
+        res
+    }
+
+    fn all_for_key(&self, key: &str) -> Set<usize> {
+        match key {
+            "count" => self
+                .by_count
+                .values()
+                .fold(Set::new(), |acc, s| acc.union(s)),
+            "index" => self
+                .by_index
+                .values()
+                .fold(Set::new(), |acc, s| acc.union(s)),
+            "time" => self
+                .by_time
+                .values()
+                .fold(Set::new(), |acc, s| acc.union(s)),
+            "id" => self.by_id.values().fold(Set::new(), |acc, s| acc.union(s)),
+            _ => Set::new(),
+        }
+    }
+
+    fn all(&self) -> Set<usize> {
+        self.by_count
+            .values()
+            .chain(self.by_index.values())
+            .chain(self.by_time.values())
+            .chain(self.by_id.values())
+            .fold(Set::new(), |acc, s| acc.union(s))
+    }
+
+    fn query(&self, q: &Query) -> Set<usize> {
+        match q {
+            Query::Eq(f) => self.eq(f),
+            Query::Gt(f) => self.gt_gte(false, f),
+            Query::Gte(f) => self.gt_gte(true, f),
+            Query::Lt(f) => self.lt_lte(false, f),
+            Query::Lte(f) => self.lt_lte(true, f),
+            Query::And(qs) => qs
+                .iter()
+                .map(|q| self.query(q))
+                .fold(None, |acc: Option<Set<_>>, s| match acc {
+                    Some(acc) => Some(acc.intersect(&s)),
+                    None => Some(s),
+                })
+                .unwrap_or_else(Set::new),
+            Query::Or(qs) => qs
+                .iter()
+                .map(|q| self.query(q))
+                .fold(Set::new(), |acc, s| acc.union(&s)),
+            Query::Not(q) => match &**q {
+                Query::Eq(f) => self.all_for_key(f.key()).diff(&self.eq(f)),
+                Query::Gt(f) => self.lt_lte(true, f),
+                Query::Gte(f) => self.lt_lte(false, f),
+                Query::Lt(f) => self.gt_gte(true, f),
+                Query::Lte(f) => self.gt_gte(false, f),
+                q @ Query::And(_) | q @ Query::Or(_) | q @ Query::Not(_) => {
+                    self.all().diff(&self.query(q))
+                }
+            },
+        }
+    }
+
     fn generate(n: usize) -> Model {
-	let mut model = Self {
-	    records: vec![],
-	    by_time: BTreeMap::new(),
-	    by_count: BTreeMap::new(),
-	    by_index: BTreeMap::new(),
-	    by_id: BTreeMap::new(),
-	};
-	for _ in 0..n {
-	    model.records.push(TestRec::gen());
-	}
-	model.records.sort_by_key(|r| r.timestamp());
-	for i in 0..n {
-	    match &model.records[i] {
-		TestRec::Foo(f) => {
-		    model.by_time.insert(f.time, i);
-		    model.by_count.insert(f.count, i);
-		    model.by_index.insert(f.index, i);
-		}
-		TestRec::Bar(b) => {
-		    model.by_time.insert(b.time, i);
-		    model.by_id.insert(b.id.clone(), i);
-		}
-	    }
-	}
-	model
+        let mut model = Self {
+            records: vec![],
+            by_time: BTreeMap::new(),
+            by_count: BTreeMap::new(),
+            by_index: BTreeMap::new(),
+            by_id: BTreeMap::new(),
+        };
+        for _ in 0..n {
+            model.records.push(TestRec::gen());
+        }
+        model.records.sort_by_key(|r| r.timestamp());
+        for i in 0..n {
+            match &model.records[i] {
+                TestRec::Foo(f) => {
+                    model
+                        .by_time
+                        .entry(f.time)
+                        .or_insert(Set::new())
+                        .insert_cow(i);
+                    model
+                        .by_count
+                        .entry(f.count)
+                        .or_insert(Set::new())
+                        .insert_cow(i);
+                    model
+                        .by_index
+                        .entry(f.index)
+                        .or_insert(Set::new())
+                        .insert_cow(i);
+                }
+                TestRec::Bar(b) => {
+                    model
+                        .by_time
+                        .entry(b.time)
+                        .or_insert(Set::new())
+                        .insert_cow(i);
+                    model
+                        .by_id
+                        .entry(b.id.clone())
+                        .or_insert(Set::new())
+                        .insert_cow(i);
+                }
+            }
+        }
+        model
     }
 }
 
@@ -255,7 +423,7 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
     let name = format!("test-data{}", N.fetch_add(1, MemOrdering::Relaxed));
     let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(&name);
     if dir.exists() {
-	std::fs::remove_dir_all(&dir)?;
+        std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
     let db = IndexedJson::new(&dir).await?;
@@ -266,14 +434,14 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
 async fn test_append_get_n(n: usize) {
     let (mut db, model) = init(n).await.unwrap();
     for r in model.records.iter() {
-	db.append(r).await.unwrap()
+        db.append(r).await.unwrap()
     }
     db.flush().await.unwrap();
     let mut i = db.first().unwrap();
     for j in 0..n {
-	let (new_i, t) = db.get(i).await.unwrap().unwrap();
-	assert_eq!(&t, &model.records[j]);
-	i = new_i;
+        let (new_i, t) = db.get(i).await.unwrap().unwrap();
+        assert_eq!(&t, &model.records[j]);
+        i = new_i;
     }
     assert_eq!(None, db.get(i).await.unwrap())
 }
@@ -286,4 +454,12 @@ async fn test_append_get_small() {
 #[tokio::test]
 async fn test_append_get_large() {
     test_append_get_n(1000000).await
+}
+
+#[tokio::test]
+async fn test_index_query() {
+    let (mut db, model) = init(100000).await.unwrap();
+    for r in model.records.iter() {
+        db.append(r).await.unwrap()
+    }
 }
