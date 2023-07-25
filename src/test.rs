@@ -149,7 +149,7 @@ fn gen_time() -> DateTime<Utc> {
     base + chrono::Duration::milliseconds(off as i64)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct Foo {
     time: Time,
     count: Count,
@@ -161,14 +161,14 @@ impl Foo {
     fn gen() -> Self {
         Self {
             time: Time(gen_time()),
-            count: Count(thread_rng().gen()),
-            index: Index(thread_rng().gen()),
+            count: Count(thread_rng().gen_range(0..1000)),
+            index: Index(thread_rng().gen_range(0..1000)),
             desc: gen_string(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct Bar {
     time: Time,
     id: Id,
@@ -185,7 +185,7 @@ impl Bar {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "type")]
 enum TestRec {
     Foo(Foo),
@@ -431,6 +431,15 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
     Ok((db, model))
 }
 
+async fn init_and_append(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
+    let (mut db, model) = init(100000).await?;
+    for r in model.records.iter() {
+        db.append(r).await?
+    }
+    db.flush().await?;
+    Ok((db, model))
+}
+
 async fn test_append_get_n(n: usize) {
     let (mut db, model) = init(n).await.unwrap();
     for r in model.records.iter() {
@@ -446,6 +455,26 @@ async fn test_append_get_n(n: usize) {
     assert_eq!(None, db.get(i).await.unwrap())
 }
 
+async fn exec_query<'a>(
+    model: &'a Model,
+    db: &mut IndexedJson<TestRec>,
+    q: &Query,
+) -> (Vec<&'a TestRec>, Vec<TestRec>) {
+    let mut model_res = model
+        .query(&q)
+        .into_iter()
+        .map(|i| &model.records[*i])
+        .collect::<Vec<_>>();
+    let mut db_res = vec![];
+    for i in &db.query(q).unwrap() {
+        let (_next, t) = db.get(*i).await.unwrap().unwrap();
+        db_res.push(t);
+    }
+    model_res.sort();
+    db_res.sort();
+    (model_res, db_res)
+}
+
 #[tokio::test]
 async fn test_append_get_small() {
     test_append_get_n(10).await
@@ -453,13 +482,19 @@ async fn test_append_get_small() {
 
 #[tokio::test]
 async fn test_append_get_large() {
-    test_append_get_n(1000000).await
+    test_append_get_n(1_000_000).await
 }
 
 #[tokio::test]
-async fn test_index_query() {
-    let (mut db, model) = init(100000).await.unwrap();
-    for r in model.records.iter() {
-        db.append(r).await.unwrap()
+async fn test_query_eq() {
+    let (mut db, model) = init_and_append(100_000).await.unwrap();
+    let r = &model.records[0];
+    let f = match r {
+        TestRec::Bar(b) => Box::new(b.id.clone()) as Box<dyn IndexableField>,
+        TestRec::Foo(f) => Box::new(f.count) as Box<dyn IndexableField>,
+    };
+    let (model_res, db_res) = exec_query(&model, &mut db, &Query::Eq(f)).await;
+    if !model_res.iter().zip(db_res.iter()).all(|(mr, dr)| *mr == dr) {
+	panic!("{:?} differs from {:?}", model_res, db_res)
     }
 }
