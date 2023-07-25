@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use bytes::Buf;
 use chrono::{DateTime, NaiveDate, Utc};
 use compact_str::CompactString;
+use futures::future;
 use fxhash::FxHashMap;
 use immutable_chunkmap::set::SetM as Set;
 use log::{error, warn};
@@ -14,17 +15,19 @@ use serde::{Deserialize, Serialize};
 use sled::IVec;
 use smallvec::SmallVec;
 use std::{
-    cmp::{max, Ordering},
+    cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fmt::Debug,
     io::SeekFrom,
+    iter,
     marker::PhantomData,
     path::{Path, PathBuf},
+    result,
     time::UNIX_EPOCH,
 };
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream, AsyncBufReadExt},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufStream},
     task,
 };
 
@@ -104,7 +107,7 @@ struct JsonFile<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     len: u64,
     pos: u64,
     rbuf: String,
-    wbuf: Vec<u8>
+    wbuf: Vec<u8>,
 }
 
 macro_rules! open_file {
@@ -119,10 +122,10 @@ macro_rules! open_file {
                 .create(true)
                 .open(&$self.path)
                 .await?;
-	    let mut f = BufStream::new(f);
-	    let len = f.seek(SeekFrom::End(0)).await?;
-	    $self.len = len;
-	    $self.pos = len;
+            let mut f = BufStream::new(f);
+            let len = f.seek(SeekFrom::End(0)).await?;
+            $self.len = len;
+            $self.pos = len;
             $self.file = Some(f);
             $self.file.as_mut().unwrap()
         }
@@ -137,10 +140,10 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
             file: None,
             path: base.as_ref().join(&format!("{name}")),
             name,
-	    pos: 0,
-	    len: 0,
-	    rbuf: String::new(),
-	    wbuf: Vec::new(),
+            pos: 0,
+            len: 0,
+            rbuf: String::new(),
+            wbuf: Vec::new(),
         }
     }
 
@@ -161,21 +164,28 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
     async fn get(&mut self, pos: u64) -> Result<Option<(u64, T)>> {
         self.last_used = Utc::now();
         let file = open_file!(self);
-	if pos != self.pos {
+        if pos != self.pos {
             let new_pos = file.seek(SeekFrom::Start(pos)).await?;
             if new_pos != pos {
-		bail!("{pos} doesn't exist in {:?}", &self.name)
+                bail!("{pos} doesn't exist in {:?}", &self.name)
             }
-	    self.pos = new_pos;
-	}
-	self.rbuf.clear();
-	let read = file.read_line(&mut self.rbuf).await?;
+            self.pos = new_pos;
+        }
+        self.rbuf.clear();
+        let read = file.read_line(&mut self.rbuf).await?;
         if self.rbuf.len() == 0 {
             Ok(None)
         } else {
-	    self.pos = self.pos + read as u64;
+            self.pos = self.pos + read as u64;
             Ok(Some((self.pos, serde_json::from_str(&self.rbuf.trim())?)))
         }
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if let Some(file) = &mut self.file {
+            file.flush().await?
+        }
+        Ok(())
     }
 
     fn db_name(&self) -> CompactString {
@@ -196,17 +206,17 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
     async fn append(&mut self, record: &T) -> Result<u64> {
         self.last_used = Utc::now();
         let file = open_file!(self);
-	if self.pos != self.len {
-	    file.flush().await?;
+        if self.pos != self.len {
+            file.flush().await?;
             self.pos = file.seek(SeekFrom::End(0)).await?;
-	    self.len = self.pos;
-	}
-	self.wbuf.clear();
+            self.len = self.pos;
+        }
+        self.wbuf.clear();
         serde_json::to_writer(&mut self.wbuf, record)?;
         self.wbuf.push(b'\n');
         file.write_all(&self.wbuf).await?;
-	self.pos += self.wbuf.len() as u64;
-	self.len += self.wbuf.len() as u64;
+        self.pos += self.wbuf.len() as u64;
+        self.len += self.wbuf.len() as u64;
         Ok(self.pos)
     }
 }
@@ -427,13 +437,20 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
     }
 
-    /// flush the index database
+    /// flush the files and the index database
     pub async fn flush(&mut self) -> Result<()> {
-        for tree in self.trees.values() {
-            tree.flush_async().await?;
-        }
-        self.db.flush_async().await?;
-        self.index_status.flush_async().await?;
+        future::join_all(self.files.values_mut().map(|f| f.flush()))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        future::join_all(
+            (iter::once(&*self.db)
+                .chain(iter::once(&self.index_status).chain(self.trees.values())))
+            .map(|t| t.flush_async()),
+        )
+        .await
+        .into_iter()
+        .collect::<result::Result<Vec<_>, _>>()?;
         Ok(())
     }
 
