@@ -24,7 +24,7 @@ use std::{
 };
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream, AsyncBufReadExt},
     task,
 };
 
@@ -98,10 +98,13 @@ pub struct IndexEntry {
 struct JsonFile<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     phantom: PhantomData<T>,
     last_used: DateTime<Utc>,
-    file: Option<File>,
+    file: Option<BufStream<File>>,
     path: PathBuf,
     name: NaiveDate,
-    buf: Vec<u8>,
+    len: u64,
+    pos: u64,
+    rbuf: String,
+    wbuf: Vec<u8>
 }
 
 macro_rules! open_file {
@@ -116,6 +119,10 @@ macro_rules! open_file {
                 .create(true)
                 .open(&$self.path)
                 .await?;
+	    let mut f = BufStream::new(f);
+	    let len = f.seek(SeekFrom::End(0)).await?;
+	    $self.len = len;
+	    $self.pos = len;
             $self.file = Some(f);
             $self.file.as_mut().unwrap()
         }
@@ -130,7 +137,10 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
             file: None,
             path: base.as_ref().join(&format!("{name}")),
             name,
-            buf: vec![],
+	    pos: 0,
+	    len: 0,
+	    rbuf: String::new(),
+	    wbuf: Vec::new(),
         }
     }
 
@@ -148,42 +158,23 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
         }
     }
 
-    // buf will contain the line on success
-    async fn read_line(buf: &mut Vec<u8>, file: &mut File) -> Result<()> {
-        let mut pos = 0;
-        loop {
-            if pos >= buf.len() {
-                buf.resize(max(128, pos << 1), 0u8);
-            }
-            let count = file.read(&mut buf[pos..]).await?;
-            if count == 0 {
-                buf.resize(0, 0);
-                return Ok(());
-            }
-            for i in pos..pos + count {
-                if buf[i] == b'\n' {
-                    buf.resize(i + 1, 0);
-                    return Ok(());
-                }
-            }
-            pos += count;
-        }
-    }
-
     async fn get(&mut self, pos: u64) -> Result<Option<(u64, T)>> {
         self.last_used = Utc::now();
         let file = open_file!(self);
-        let new_pos = file.seek(SeekFrom::Start(pos)).await?;
-        if new_pos != pos {
-            bail!("{pos} doesn't exist in {:?}", &self.name)
-        }
-        Self::read_line(&mut self.buf, file).await?;
-        if self.buf.len() == 0 {
+	if pos != self.pos {
+            let new_pos = file.seek(SeekFrom::Start(pos)).await?;
+            if new_pos != pos {
+		bail!("{pos} doesn't exist in {:?}", &self.name)
+            }
+	    self.pos = new_pos;
+	}
+	self.rbuf.clear();
+	let read = file.read_line(&mut self.rbuf).await?;
+        if self.rbuf.len() == 0 {
             Ok(None)
         } else {
-            let new_pos = pos + self.buf.len() as u64;
-            self.buf.pop(); // take out the newline
-            Ok(Some((new_pos, serde_json::from_slice(&self.buf[..])?)))
+	    self.pos = self.pos + read as u64;
+            Ok(Some((self.pos, serde_json::from_str(&self.rbuf.trim())?)))
         }
     }
 
@@ -205,12 +196,18 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
     async fn append(&mut self, record: &T) -> Result<u64> {
         self.last_used = Utc::now();
         let file = open_file!(self);
-        let pos = file.seek(SeekFrom::End(0)).await?;
-        self.buf.clear();
-        serde_json::to_writer(&mut self.buf, record)?;
-        self.buf.push(b'\n');
-        file.write_all(&self.buf).await?;
-        Ok(pos)
+	if self.pos != self.len {
+	    file.flush().await?;
+            self.pos = file.seek(SeekFrom::End(0)).await?;
+	    self.len = self.pos;
+	}
+	self.wbuf.clear();
+        serde_json::to_writer(&mut self.wbuf, record)?;
+        self.wbuf.push(b'\n');
+        file.write_all(&self.wbuf).await?;
+	self.pos += self.wbuf.len() as u64;
+	self.len += self.wbuf.len() as u64;
+        Ok(self.pos)
     }
 }
 
