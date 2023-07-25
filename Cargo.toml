@@ -1,0 +1,23 @@
+[package]
+name = "indexed_json"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.72"
+bytes = "1.4.0"
+chrono = "0.4.26"
+compact_str = "0.7.1"
+immutable-chunkmap = "2.0.0"
+log = "0.4.19"
+netidx-core = "0.22.18"
+netidx-derive = "0.22.0"
+serde = "1.0.175"
+serde_json = "1.0.103"
+sled = "0.34.7"
+smallvec = "1.11.0"
+tokio = { version = "1.29.1", features = ["rt", "fs", "io-util", "macros"] }
+
+[dev-dependencies]
+serde_derive = "1"
+rand = "0.8.5"
