@@ -432,7 +432,7 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
 }
 
 async fn init_and_append(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
-    let (mut db, model) = init(100000).await?;
+    let (mut db, model) = init(n).await?;
     for r in model.records.iter() {
         db.append(r).await?
     }
