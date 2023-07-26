@@ -2,6 +2,15 @@
 name = "indexed_json"
 version = "0.1.0"
 edition = "2021"
+authors = ["Eric Stokes <eric@architect.xyz>"]
+license = "MIT"
+description = "Index json files like a database"
+homepage = "https://github.com/estokes/indexed-json"
+repository = "https://github.com/estokes/indexed-json"
+documentation = "https://docs.rs/indexed-json"
+readme = "README.md"
+keywords = ["database"]
+categories = ["data-structures"]
 
 [profile.release]
 codegen-units = 1
