@@ -433,10 +433,13 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
 
 async fn init_and_append(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
     let (mut db, model) = init(n).await?;
+    dbg!("starting write");
     for r in model.records.iter() {
         db.append(r).await?
     }
+    dbg!("starting flush");
     db.flush().await?;
+    dbg!("flushed");
     Ok((db, model))
 }
 
@@ -488,25 +491,45 @@ async fn test_append_get_large() {
 async fn test_query_gen(q: impl Fn(&TestRec) -> Query) {
     let (mut db, model) = init_and_append(100_000).await.unwrap();
     let r = &model.records[0];
-    let q = q(r);
+    let q = dbg!(q(r));
     let (model_res, db_res) = exec_query(&model, &mut db, &q).await;
-    if !model_res.iter().zip(db_res.iter()).all(|(mr, dr)| *mr == dr) {
-	panic!("{:?} differs from {:?}", model_res, db_res)
+    if !model_res
+        .iter()
+        .zip(db_res.iter())
+        .all(|(mr, dr)| *mr == dr)
+    {
+        panic!("{:?} differs from {:?}", model_res, db_res)
     }
     let (model_res, db_res) = exec_query(&model, &mut db, &Query::Not(Box::new(q))).await;
-    if !model_res.iter().zip(db_res.iter()).all(|(mr, dr)| *mr == dr) {
-	panic!("{:?} differs from {:?}", model_res, db_res)
+    if !model_res
+        .iter()
+        .zip(db_res.iter())
+        .all(|(mr, dr)| *mr == dr)
+    {
+        panic!("{:?} differs from {:?}", model_res, db_res)
     }
 }
 
 async fn test_single_query_gen(f: impl Fn(Box<dyn IndexableField>) -> Query) {
-    test_query_gen(|r| {
-	let field = match r {
-            TestRec::Bar(b) => Box::new(b.id.clone()) as Box<dyn IndexableField>,
-            TestRec::Foo(f) => Box::new(f.count) as Box<dyn IndexableField>,
-	};
-	f(field)
-    }).await
+    test_query_gen(|r| match r {
+        TestRec::Bar(b) => {
+	    if thread_rng().gen_bool(0.5) {
+		f(Box::new(b.id.clone()))
+	    } else {
+		f(Box::new(b.time))
+	    }
+	},
+        TestRec::Foo(b) => {
+	    if thread_rng().gen_bool(0.33) {
+		f(Box::new(b.count))
+	    } else if thread_rng().gen_bool(0.33) {
+		f(Box::new(b.index))
+	    } else {
+		f(Box::new(b.time))
+	    }
+	},
+    })
+    .await
 }
 
 #[tokio::test]
@@ -534,3 +557,34 @@ async fn test_query_gte() {
     test_single_query_gen(Query::Gte).await
 }
 
+#[tokio::test]
+async fn test_query_and() {
+    test_query_gen(|r| match r {
+        TestRec::Bar(b) => Query::And(vec![
+            Query::Eq(Box::new(b.time)),
+            Query::Gte(Box::new(b.id.clone())),
+        ]),
+        TestRec::Foo(f) => Query::And(vec![
+            Query::Lte(Box::new(f.count)),
+            Query::Eq(Box::new(f.time)),
+            Query::Eq(Box::new(f.index)),
+        ]),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_query_or() {
+    test_query_gen(|r| match r {
+        TestRec::Bar(b) => dbg!(Query::Or(vec![
+            Query::Lt(Box::new(b.time)),
+            Query::Eq(Box::new(b.id.clone())),
+        ])),
+        TestRec::Foo(f) => dbg!(Query::Or(vec![
+	    Query::Lt(Box::new(f.time)),
+            Query::Eq(Box::new(f.count)),
+            Query::Eq(Box::new(f.index)),
+        ])),
+    })
+    .await
+}

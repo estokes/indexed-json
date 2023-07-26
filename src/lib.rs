@@ -20,10 +20,8 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
     io::SeekFrom,
-    iter,
     marker::PhantomData,
     path::{Path, PathBuf},
-    result,
     time::UNIX_EPOCH,
 };
 use tokio::{
@@ -450,14 +448,23 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        future::join_all(
-            (iter::once(&*self.db)
-                .chain(iter::once(&self.index_status).chain(self.trees.values())))
-            .map(|t| t.flush_async()),
-        )
-        .await
-        .into_iter()
-        .collect::<result::Result<Vec<_>, _>>()?;
+        task::spawn_blocking({
+            let db = self.db.clone();
+            move || db.flush()
+        })
+        .await??;
+        task::spawn_blocking({
+            let db = self.index_status.clone();
+            move || db.flush()
+        })
+        .await??;
+        for tree in self.trees.values() {
+            task::spawn_blocking({
+                let db = tree.clone();
+                move || db.flush()
+            })
+            .await??;
+        }
         Ok(())
     }
 
@@ -569,9 +576,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                         for r in tree.iter() {
                             let (k, v) = r?;
                             match field.decode_cmp(&k[..cmp::min(key.len(), k.len() - 8) - 1])? {
-                                Ordering::Greater => insert(&mut set, &*k, &*v),
+                                Ordering::Less => insert(&mut set, &*k, &*v),
                                 Ordering::Equal if gte => insert(&mut set, &*k, &*v),
-                                Ordering::Equal | Ordering::Less => (),
+                                Ordering::Equal | Ordering::Greater => (),
                             }
                         }
                     }
@@ -608,9 +615,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                         for r in tree.iter() {
                             let (k, v) = r?;
                             match field.decode_cmp(&k[..cmp::min(key.len(), k.len() - 8) - 1])? {
-                                Ordering::Less => insert(&mut set, &*k, &*v),
+                                Ordering::Greater => insert(&mut set, &*k, &*v),
                                 Ordering::Equal if lte => insert(&mut set, &*k, &*v),
-                                Ordering::Equal | Ordering::Greater => (),
+                                Ordering::Equal | Ordering::Less => (),
                             }
                         }
                     }
