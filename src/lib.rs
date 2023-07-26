@@ -280,6 +280,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// Open an existing indexed json archive, or create a new one. If
     /// the index is missing or outdated then it will be rebuilt.
     pub async fn open(base: impl AsRef<Path>) -> Result<Self> {
+	if !base.as_ref().exists() {
+	    fs::create_dir_all(&base).await?;
+	}
         if !fs::metadata(&base).await?.is_dir() {
             bail!("{:?} is not a directory", base.as_ref())
         }
