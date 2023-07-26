@@ -367,7 +367,7 @@ impl Model {
         }
     }
 
-    fn generate(n: usize) -> Model {
+    fn new(iter: impl IntoIterator<Item = TestRec>) -> Model {
         let mut model = Self {
             records: vec![],
             by_time: BTreeMap::new(),
@@ -375,12 +375,10 @@ impl Model {
             by_index: BTreeMap::new(),
             by_id: BTreeMap::new(),
         };
-        for _ in 0..n {
-            model.records.push(TestRec::gen());
-        }
+	model.records.extend(iter);
         model.records.sort_by_key(|r| r.timestamp());
-        for i in 0..n {
-            match &model.records[i] {
+        for (i, r) in model.records.iter().enumerate() {
+            match r {
                 TestRec::Foo(f) => {
                     model
                         .by_time
@@ -412,7 +410,11 @@ impl Model {
                 }
             }
         }
-        model
+	model
+    }
+
+    fn generate(n: usize) -> Model {
+	Self::new((0..n).into_iter().map(|_| TestRec::gen()))
     }
 }
 
@@ -426,7 +428,7 @@ async fn init(n: usize) -> Result<(IndexedJson<TestRec>, Model)> {
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
-    let db = IndexedJson::new(&dir).await?;
+    let db = IndexedJson::open(&dir).await?;
     let model = Model::generate(n);
     Ok((db, model))
 }
@@ -587,4 +589,42 @@ async fn test_query_or() {
         ])),
     })
     .await
+}
+
+#[tokio::test]
+async fn test_reindex() {
+    use std::{fs::OpenOptions, io::Write};
+    let (db, mut model) = init_and_append(100_000).await.unwrap();
+    let path = PathBuf::from(db.path());
+    let file = path.read_dir().unwrap().filter_map(|e| {
+	let e = e.unwrap();
+	if e.file_type().unwrap().is_file() {
+	    Some(e.path())
+	} else {
+	    None
+	}
+    }).next().unwrap();
+    let new_t = TestRec::gen();
+    let mut fd = OpenOptions::new().append(true).open(&file).unwrap();
+    serde_json::to_writer(&mut fd, &new_t).unwrap();
+    fd.write_all(&[b'\n']).unwrap();
+    drop(fd);
+    drop(db);
+    model.records.push(new_t.clone());
+    model.records.sort_by_key(|t| t.timestamp());
+    let model = Model::new(model.records);
+    // should detect that a file is modified and reindex the archive
+    let mut db = IndexedJson::open(&path).await.unwrap();
+    let q = match &new_t {
+	TestRec::Bar(b) => dbg!(Query::Eq(Box::new(b.id.clone()))),
+	TestRec::Foo(f) => dbg!(Query::Eq(Box::new(f.time)))
+    };
+    let (model_res, db_res) = exec_query(&model, &mut db, &q).await;
+    if !model_res
+        .iter()
+        .zip(db_res.iter())
+        .all(|(mr, dr)| *mr == dr)
+    {
+        panic!("{:?} differs from {:?}", model_res, db_res)
+    }
 }

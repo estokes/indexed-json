@@ -1,13 +1,38 @@
 /* Copyright 2023 Architect Financial Technologies LLC. This is free
  * software released under the MIT license */
 
+//! With this module you can store serde serializable types in simple
+//! newline delimited json formatted text files and index fields in
+//! those records for quick querying and retreival of matching records
+//! not unlike in a relational database.
+//!
+//! The main intended use case is logging of important books and
+//! records that need to be stored in a simple and accessible format
+//! which can be processed by external tools and backed up online by
+//! simple tools. Writing such records as json text to simple text
+//! files is about as interoperable and resiliant as you can get. At
+//! the same time this library will build an index of an arbitrary set
+//! of fields in your records so that queries can be run on the data
+//! set as if it was in a database. The index can be freely deleted,
+//! and if it becomes corrupted, it can simply be rebuilt, the core
+//! data is never touched.
+//!
+//! This is not exactly a full database, since it doesn't support
+//! modification of records efficiently. If you want to change an
+//! existing record, you can just do that, you can even open the file
+//! in emacs and just edit it. However in that case the entire index
+//! will be invalidated and rebuilt, which can take some
+//! time. Therefore this should be considered an append only database,
+//! since only append is implemented efficiently (which for our use
+//! case is perfectly fine).
+
 use anyhow::{bail, Result};
 use bytes::Buf;
 use chrono::{DateTime, NaiveDate, Utc};
 use compact_str::CompactString;
 use futures::future;
 use fxhash::FxHashMap;
-use immutable_chunkmap::set::SetM as Set;
+use immutable_chunkmap::set::SetS as Set;
 use log::{error, warn};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
@@ -33,6 +58,7 @@ use tokio::{
 #[cfg(test)]
 mod test;
 
+/// A query against the index
 #[derive(Debug)]
 pub enum Query {
     Eq(Box<dyn IndexableField>),
@@ -52,7 +78,10 @@ pub trait IndexableField: Debug + Send + Any {
     /// return the database key that should be used for this field
     fn key(&self) -> &'static str;
 
-    /// return true if these objects can be compared bytewise
+    /// return true if this object can be compared by comparing
+    /// their encoded bytes. This is true for e.g. big endian encoded
+    /// integers, strings, and a lot of other types, but not generally
+    /// for, chrono::DateTime, Decimal, etc..
     fn byte_compareable(&self) -> bool;
 
     /// Place the database representation of the value into the
@@ -70,18 +99,25 @@ pub trait IndexableField: Debug + Send + Any {
 
     /// return a downcastable object to recover the original type of
     /// the indexable value in a query. This is a work around until
-    /// trait upcasting is stabilized.
+    /// trait upcasting is stabilized. (this is currenly only used by
+    /// the unit tests, but who knows, it could be useful)
     fn as_any(&self) -> &dyn Any;
 }
 
-/// An indexable type
+/// This must be implemented for a type to be indexable
 pub trait Indexable {
     type Iter: IntoIterator<Item = Box<dyn IndexableField>>;
 
     /// Return an iterator of indexable values in this record.
     fn index(&self) -> Self::Iter;
 
-    /// return the timestamp of this record
+    /// return the timestamp of this record. This will only be used to
+    /// figure out what file to put the record in. The only real
+    /// reason why there are multiple files is to ensure logs are
+    /// rotated periodically so they can be backed up, and potentially
+    /// archived permanently. If you just return the same timestamp
+    /// for every record then there will just be one file and
+    /// everything else will work fine.
     fn timestamp(&self) -> DateTime<Utc>;
 }
 
@@ -95,10 +131,13 @@ fn max_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
     Ok(iter.next_back().transpose()?.map(|(k, _)| k))
 }
 
+/// This is the location of a record in the archive.
 #[derive(Debug, Clone, Copy, Pack, PartialEq, Eq, PartialOrd, Ord)]
 #[pack(unwrapped)]
 pub struct IndexEntry {
+    /// which file is the record in
     pub file: NaiveDate,
+    /// offset from the beginning of the file where the record begins
     pub offset: u64,
 }
 
@@ -226,15 +265,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
     }
 }
 
-/// Simple line structured json archives with database like indexing
-///
-/// Maintain a set of newline delimited json formatted text files and
-/// a database indexing various fields in them for efficient query
-/// execution.
-///
-/// records are written to date named files corresponding to when they
-/// begin. e.g. `2023-09-12`. New records are indexed automatically
-/// after they are written.
+/// An indexed json archive
 pub struct IndexedJson<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     phantom: PhantomData<T>,
     base: PathBuf,
@@ -246,10 +277,9 @@ pub struct IndexedJson<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
 }
 
 impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
-    /// given the path to a directory where date named json files are
-    /// stored, create a new IndexedJson archive. If the index is
-    /// missing or outdated then it will be rebuilt.
-    pub async fn new(base: impl AsRef<Path>) -> Result<Self> {
+    /// Open an existing indexed json archive, or create a new one. If
+    /// the index is missing or outdated then it will be rebuilt.
+    pub async fn open(base: impl AsRef<Path>) -> Result<Self> {
         if !fs::metadata(&base).await?.is_dir() {
             bail!("{:?} is not a directory", base.as_ref())
         }
@@ -283,6 +313,11 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         Ok(t)
     }
 
+    /// the base path of the archive
+    pub fn path(&self) -> &Path {
+	&self.base
+    }
+    
     // note this will close all open files as well as add any new
     // files that have appeared on disk to the database.
     async fn rescan_files(&mut self) -> Result<()> {
@@ -346,13 +381,17 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     }
 
     /// Rebuild the index only if necessary. This is called
-    /// automatically by `new`. However if you know, or suspect, the
-    /// files have been modified since then, you can call again and it
-    /// will check and rebuild the index if they have. Before checking
-    /// it will also rescan the filesystem. As a result, all open
-    /// files will be closed. Any new files will be added to the
-    /// index, and missing files will be removed from it. If any new
-    /// files appear or old files disappear the index will be rebuilt.
+    /// automatically by `open`. However if you know, or suspect, the
+    /// files have been modified out of band since then, you can call
+    /// again and it will check and rebuild the index if they have.
+    ///
+    /// There is no need to do this if you just called `append`.
+    ///
+    /// Before checking it will also rescan the filesystem. As a
+    /// result, all open files will be closed. Any new files will be
+    /// added to the index, and missing files will be removed from
+    /// it. So if any new files appear or old files disappear the
+    /// index will be rebuilt.
     ///
     /// If the index is damaged you can call `reindex`, which will
     /// force it to rebuild.
@@ -442,7 +481,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
     }
 
-    /// flush the files and the index database
+    /// flush writes to disk. If you call append in batches, you
+    /// should call this at the end of each batch to make sure your
+    /// changes are flushed to disk.
     pub async fn flush(&mut self) -> Result<()> {
         future::join_all(self.files.values_mut().map(|f| f.flush()))
             .await
@@ -469,7 +510,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     }
 
     /// append the record to the end of the file corresponding to it's
-    /// timestamp and then index it.
+    /// timestamp and index it.
     pub async fn append(&mut self, record: &T) -> Result<()> {
         let name = record.timestamp().date_naive();
         let file = self
@@ -502,7 +543,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// retreive the specified record from the json files. Returns a
     /// pair of the record and the next entry index if there is
     /// one. If None is returned then there were no more entries in
-    /// the archive.
+    /// the archive. You can iterate through all the records in the
+    /// archive by starting with `first` and calling get with each
+    /// successive record until it returns `None`
     pub async fn get(&mut self, mut entry: IndexEntry) -> Result<Option<(IndexEntry, T)>> {
         loop {
             let file = self
@@ -529,7 +572,8 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     }
 
     /// execute the specified query against the index and return the
-    /// set of matching entries.
+    /// set of matching entries. You can then retrieve the matching
+    /// entries using `get`
     pub fn query(&self, query: &Query) -> Result<Set<IndexEntry>> {
         fn field_k(field: &Box<dyn IndexableField>) -> Result<SmallVec<[u8; 128]>> {
             let mut buf = SmallVec::new();
