@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use sled::IVec;
 use smallvec::SmallVec;
 use std::{
-    cmp::Ordering,
+    any::Any,
+    cmp::{self, Ordering},
     collections::{BTreeMap, HashMap},
     fmt::Debug,
     io::SeekFrom,
@@ -23,7 +24,7 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     result,
-    time::UNIX_EPOCH, any::Any,
+    time::UNIX_EPOCH,
 };
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -211,6 +212,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
     async fn append(&mut self, record: &T) -> Result<u64> {
         self.last_used = Utc::now();
         let file = open_file!(self);
+        let pos = self.pos;
         if self.pos != self.len {
             file.flush().await?;
             self.pos = file.seek(SeekFrom::End(0)).await?;
@@ -222,7 +224,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> JsonFile<T> {
         file.write_all(&self.wbuf).await?;
         self.pos += self.wbuf.len() as u64;
         self.len += self.wbuf.len() as u64;
-        Ok(self.pos)
+        Ok(pos)
     }
 }
 
@@ -558,7 +560,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                         };
                         for r in tree.range(&min[..]..) {
                             let (k, v) = r?;
-                            let k = &k[0..key.len()];
+                            let k = &k[0..cmp::min(key.len(), k.len() - 8)];
                             if (gte && k >= &key[..]) || k > &key[..] {
                                 insert(&mut set, &*k, &*v)
                             }
@@ -566,7 +568,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                     } else {
                         for r in tree.iter() {
                             let (k, v) = r?;
-                            match field.decode_cmp(&k[..key.len() - 1])? {
+                            match field.decode_cmp(&k[..cmp::min(key.len(), k.len() - 8) - 1])? {
                                 Ordering::Greater => insert(&mut set, &*k, &*v),
                                 Ordering::Equal if gte => insert(&mut set, &*k, &*v),
                                 Ordering::Equal | Ordering::Less => (),
@@ -597,7 +599,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                         };
                         for r in tree.range(..=&max[..]) {
                             let (k, v) = r?;
-                            let k = &k[0..key.len()];
+                            let k = &k[0..cmp::min(key.len(), k.len() - 8)];
                             if (lte && k <= &key[..]) || k < &key[..] {
                                 insert(&mut set, &*k, &*v)
                             }
@@ -605,7 +607,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                     } else {
                         for r in tree.iter() {
                             let (k, v) = r?;
-                            match field.decode_cmp(&k[..key.len() - 1])? {
+                            match field.decode_cmp(&k[..cmp::min(key.len(), k.len() - 8) - 1])? {
                                 Ordering::Less => insert(&mut set, &*k, &*v),
                                 Ordering::Equal if lte => insert(&mut set, &*k, &*v),
                                 Ordering::Equal | Ordering::Greater => (),

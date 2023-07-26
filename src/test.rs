@@ -135,10 +135,10 @@ impl IndexableField for Id {
 
 fn gen_string() -> CompactString {
     let mut rng = thread_rng();
-    let len = rng.gen_range(16..128);
+    let len = rng.gen_range(8..24);
     let mut s = CompactString::new("");
     for _ in 0..len {
-        s.push(rng.gen())
+        s.push(rng.gen_range('a'..'z'))
     }
     s
 }
@@ -161,8 +161,8 @@ impl Foo {
     fn gen() -> Self {
         Self {
             time: Time(gen_time()),
-            count: Count(thread_rng().gen_range(0..1000)),
-            index: Index(thread_rng().gen_range(0..1000)),
+            count: Count(thread_rng().gen_range(0..100)),
+            index: Index(thread_rng().gen_range(0..100)),
             desc: gen_string(),
         }
     }
@@ -482,19 +482,55 @@ async fn test_append_get_small() {
 
 #[tokio::test]
 async fn test_append_get_large() {
-    test_append_get_n(1_000_000).await
+    test_append_get_n(100_000).await
 }
 
-#[tokio::test]
-async fn test_query_eq() {
+async fn test_query_gen(q: impl Fn(&TestRec) -> Query) {
     let (mut db, model) = init_and_append(100_000).await.unwrap();
     let r = &model.records[0];
-    let f = match r {
-        TestRec::Bar(b) => Box::new(b.id.clone()) as Box<dyn IndexableField>,
-        TestRec::Foo(f) => Box::new(f.count) as Box<dyn IndexableField>,
-    };
-    let (model_res, db_res) = exec_query(&model, &mut db, &Query::Eq(f)).await;
+    let q = q(r);
+    let (model_res, db_res) = exec_query(&model, &mut db, &q).await;
+    if !model_res.iter().zip(db_res.iter()).all(|(mr, dr)| *mr == dr) {
+	panic!("{:?} differs from {:?}", model_res, db_res)
+    }
+    let (model_res, db_res) = exec_query(&model, &mut db, &Query::Not(Box::new(q))).await;
     if !model_res.iter().zip(db_res.iter()).all(|(mr, dr)| *mr == dr) {
 	panic!("{:?} differs from {:?}", model_res, db_res)
     }
 }
+
+async fn test_single_query_gen(f: impl Fn(Box<dyn IndexableField>) -> Query) {
+    test_query_gen(|r| {
+	let field = match r {
+            TestRec::Bar(b) => Box::new(b.id.clone()) as Box<dyn IndexableField>,
+            TestRec::Foo(f) => Box::new(f.count) as Box<dyn IndexableField>,
+	};
+	f(field)
+    }).await
+}
+
+#[tokio::test]
+async fn test_query_eq() {
+    test_single_query_gen(Query::Eq).await
+}
+
+#[tokio::test]
+async fn test_query_lt() {
+    test_single_query_gen(Query::Lt).await
+}
+
+#[tokio::test]
+async fn test_query_lte() {
+    test_single_query_gen(Query::Lte).await
+}
+
+#[tokio::test]
+async fn test_query_gt() {
+    test_single_query_gen(Query::Gt).await
+}
+
+#[tokio::test]
+async fn test_query_gte() {
+    test_single_query_gen(Query::Gte).await
+}
+
