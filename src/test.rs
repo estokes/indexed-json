@@ -577,7 +577,7 @@ async fn test_query_gen(q: impl Fn(&TestRec) -> Query) {
     }
 }
 
-async fn test_single_query_gen(f: impl Fn(Arc<dyn IndexableField>) -> Query) {
+async fn test_single_query_gen(f: impl Fn(Arc<dyn IndexableField + Send>) -> Query) {
     test_query_gen(|r| match r {
         TestRec::Bar(b) => {
             if thread_rng().gen_bool(0.5) {
@@ -684,11 +684,11 @@ async fn test_reindex() {
     model.records.sort_by_key(|t| t.timestamp());
     let model = Model::new(model.records);
     // should detect that a file is modified and reindex the archive
-    let mut db = IndexedJson::open(&path).await.unwrap();
     let q = match &new_t {
         TestRec::Bar(b) => dbg!(Query::Eq(Arc::new(b.id.clone()))),
         TestRec::Foo(f) => dbg!(Query::Eq(Arc::new(f.time))),
     };
+    let mut db = IndexedJson::open(&path).await.unwrap();
     let (model_res, db_res) = exec_query(&model, &mut db, &q).await;
     if !model_res
         .iter()

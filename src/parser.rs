@@ -18,7 +18,7 @@ use fxhash::FxHashMap;
 use netidx_core::utils;
 use std::{borrow::Cow, sync::Arc};
 
-pub type LeafFn = Box<dyn Fn(&str) -> Result<Arc<dyn IndexableField>>>;
+pub type LeafFn = Box<dyn Fn(&str) -> Result<Arc<dyn IndexableField + Send>>>;
 pub type LeafTbl = FxHashMap<&'static str, LeafFn>;
 
 fn key<I>() -> impl Parser<I, Output = String>

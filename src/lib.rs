@@ -63,11 +63,11 @@ pub mod parser;
 /// A query against the index
 #[derive(Debug, Clone)]
 pub enum Query {
-    Eq(Arc<dyn IndexableField>),
-    Gt(Arc<dyn IndexableField>),
-    Gte(Arc<dyn IndexableField>),
-    Lt(Arc<dyn IndexableField>),
-    Lte(Arc<dyn IndexableField>),
+    Eq(Arc<dyn IndexableField + Send>),
+    Gt(Arc<dyn IndexableField + Send>),
+    Gte(Arc<dyn IndexableField + Send>),
+    Lt(Arc<dyn IndexableField + Send>),
+    Lte(Arc<dyn IndexableField + Send>),
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
