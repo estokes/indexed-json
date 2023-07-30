@@ -729,4 +729,5 @@ fn test_parser() {
     test("!count >= 42");
     test(r#"(count > 42 && (index > 4 || id == "hello world") && count < 125)"#);
     test("float == 3.14159");
+    test("!(float == 3.14158 || count < 42)");
 }
