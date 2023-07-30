@@ -700,7 +700,7 @@ async fn test_reindex() {
 }
 
 #[test]
-fn test_parser() {
+fn test_query_parser() {
     fn test(s: &str) {
 	let float: LeafFn = Box::new(|s| Ok(Arc::new(Float(s.parse()?))));
 	let count: LeafFn = Box::new(|s| Ok(Arc::new(Count(s.parse()?))));
