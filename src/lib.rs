@@ -63,11 +63,11 @@ pub mod parser;
 /// A query against the index
 #[derive(Debug, Clone)]
 pub enum Query {
-    Eq(Arc<dyn IndexableField + Send>),
-    Gt(Arc<dyn IndexableField + Send>),
-    Gte(Arc<dyn IndexableField + Send>),
-    Lt(Arc<dyn IndexableField + Send>),
-    Lte(Arc<dyn IndexableField + Send>),
+    Eq(Arc<dyn IndexableField + Send + Sync>),
+    Gt(Arc<dyn IndexableField + Send + Sync>),
+    Gte(Arc<dyn IndexableField + Send + Sync>),
+    Lt(Arc<dyn IndexableField + Send + Sync>),
+    Lte(Arc<dyn IndexableField + Send + Sync>),
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
@@ -137,7 +137,7 @@ impl Query {
 /// An indexable field. Indexable fields must be byte equal, meaning
 /// the decoded representation will be equal if the encoded bytes are
 /// equal. They may or may not be byte comparable.
-pub trait IndexableField: Display + Debug + Send + Any {
+pub trait IndexableField: Display + Debug + Send + Sync + Any {
     /// return the database key that should be used for this field
     fn key(&self) -> &'static str;
 

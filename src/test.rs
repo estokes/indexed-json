@@ -577,7 +577,7 @@ async fn test_query_gen(q: impl Fn(&TestRec) -> Query) {
     }
 }
 
-async fn test_single_query_gen(f: impl Fn(Arc<dyn IndexableField + Send>) -> Query) {
+async fn test_single_query_gen(f: impl Fn(Arc<dyn IndexableField + Send + Sync>) -> Query) {
     test_query_gen(|r| match r {
         TestRec::Bar(b) => {
             if thread_rng().gen_bool(0.5) {
