@@ -133,7 +133,7 @@ where
         (
             key(),
             spaces().with(op()),
-            spaces().with(choice((quoted(), int(), flt()))),
+            spaces().with(choice((quoted(), flt(), int()))),
         )
         .then(|(k, op, v)| match leaf.get(&k.as_str()) {
             None => unexpected_any(Format(format!("invalid key {}", k))).right(),

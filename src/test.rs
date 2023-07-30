@@ -10,6 +10,43 @@ use std::{
     fmt::Display,
 };
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, PartialOrd)]
+#[serde(transparent)]
+struct Float(f64);
+
+impl Deref for Float {
+    type Target = f64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Display for Float {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	write!(f, "{}", self.0)
+    }
+}
+
+impl IndexableField for Float {
+    fn byte_compareable(&self) -> bool {
+        false
+    }
+
+    fn key(&self) -> &'static str {
+        "float"
+    }
+
+    fn encode(&self, buf: &mut SmallVec<[u8; 128]>) -> Result<()> {
+        Ok(buf.extend_from_slice(&f64::to_be_bytes(self.0)))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
+    }
+}
+
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
 struct Count(u64);
@@ -665,11 +702,13 @@ async fn test_reindex() {
 #[test]
 fn test_parser() {
     fn test(s: &str) {
+	let float: LeafFn = Box::new(|s| Ok(Arc::new(Float(s.parse()?))));
 	let count: LeafFn = Box::new(|s| Ok(Arc::new(Count(s.parse()?))));
 	let index: LeafFn = Box::new(|s: &str| Ok(Arc::new(Index(s.parse()?))));
 	let time: LeafFn = Box::new(|s: &str| Ok(Arc::new(Time(s.parse()?))));
 	let id: LeafFn = Box::new(|s: &str| Ok(Arc::new(Id(CompactString::from(s)))));
 	let leaftbl = HashMap::from_iter([
+	    ("float", float),
             ("count", count),
             ("index", index),
             ("time", time),
@@ -689,4 +728,5 @@ fn test_parser() {
     test("index != 42");
     test("!count >= 42");
     test(r#"(count > 42 && (index > 4 || id == "hello world") && count < 125)"#);
+    test("float == 3.14159");
 }
