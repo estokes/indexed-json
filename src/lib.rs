@@ -36,6 +36,7 @@ use immutable_chunkmap::set::SetS as Set;
 use log::{error, warn};
 use netidx_core::pack::Pack;
 use netidx_derive::Pack;
+use parser::LeafTbl;
 use serde::{Deserialize, Serialize};
 use sled::IVec;
 use smallvec::SmallVec;
@@ -43,11 +44,11 @@ use std::{
     any::Any,
     cmp::{self, Ordering},
     collections::{BTreeMap, HashMap},
-    fmt::Debug,
+    fmt::{Debug, Display},
     io::SeekFrom,
     marker::PhantomData,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::UNIX_EPOCH, sync::Arc,
 };
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -57,24 +58,86 @@ use tokio::{
 
 #[cfg(test)]
 mod test;
+pub mod parser;
 
 /// A query against the index
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Query {
-    Eq(Box<dyn IndexableField>),
-    Gt(Box<dyn IndexableField>),
-    Gte(Box<dyn IndexableField>),
-    Lt(Box<dyn IndexableField>),
-    Lte(Box<dyn IndexableField>),
+    Eq(Arc<dyn IndexableField>),
+    Gt(Arc<dyn IndexableField>),
+    Gte(Arc<dyn IndexableField>),
+    Lt(Arc<dyn IndexableField>),
+    Lte(Arc<dyn IndexableField>),
     And(Vec<Query>),
     Or(Vec<Query>),
     Not(Box<Query>),
 }
 
+impl Display for Query {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	use Query::*;
+	match self {
+	    Eq(i) => write!(f, "{} == {}", i.key(), i),
+	    Gt(i) => write!(f, "{} > {}", i.key(), i),
+	    Gte(i) => write!(f, "{} >= {}", i.key(), i),
+	    Lt(i) => write!(f, "{} < {}", i.key(), i),
+	    Lte(i) => write!(f, "{} <= {}", i.key(), i),
+	    Not(i) => match &**i {
+		Eq(i) => write!(f, "{} != {}", i.key(), i),
+		q => write!(f, "!{}", q)
+	    }
+	    And(qs) => {
+		let len = qs.len();
+		if len == 0 {
+		    Ok(())
+		} else if len == 1 {
+		    write!(f, "{}", &qs[0])
+		} else {
+		    write!(f, "(")?;
+		    for (i, q) in qs.iter().enumerate() {
+			if i < len - 1 {
+			    write!(f, "{} && ", q)?
+			} else {
+			    write!(f, "{}", q)?
+			}
+		    }
+		    write!(f, ")")
+		}
+	    }
+	    Or(qs) => {
+		let len = qs.len();
+		if len == 0 {
+		    Ok(())
+		} else if len == 1 {
+		    write!(f, "{}", &qs[0])
+		} else {
+		    write!(f, "(")?;
+		    for (i, q) in qs.iter().enumerate() {
+			if i < len - 1 {
+			    write!(f, "{} || ", q)?
+			} else {
+			    write!(f, "{}", q)?
+			}
+		    }
+		    write!(f, ")")
+		}
+	    }
+	}
+    }
+}
+
+impl Query {
+    /// Given a table of key -> constructor functions for leaf nodes,
+    /// parse the specified string as a query and return it.
+    pub fn parse(leaf: &LeafTbl, s: &str) -> Result<Query> {
+	parser::parse_query(leaf, s)
+    }
+}
+
 /// An indexable field. Indexable fields must be byte equal, meaning
 /// the decoded representation will be equal if the encoded bytes are
 /// equal. They may or may not be byte comparable.
-pub trait IndexableField: Debug + Send + Any {
+pub trait IndexableField: Display + Debug + Send + Any {
     /// return the database key that should be used for this field
     fn key(&self) -> &'static str;
 
@@ -578,7 +641,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// set of matching entries. You can then retrieve the matching
     /// entries using `get`
     pub fn query(&self, query: &Query) -> Result<Set<IndexEntry>> {
-        fn field_k(field: &Box<dyn IndexableField>) -> Result<SmallVec<[u8; 128]>> {
+        fn field_k(field: &dyn IndexableField) -> Result<SmallVec<[u8; 128]>> {
             let mut buf = SmallVec::new();
             field.encode(&mut buf)?;
             buf.push(b'/');
@@ -596,7 +659,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
         fn gt_gte(
             trees: &FxHashMap<CompactString, sled::Tree>,
-            field: &Box<dyn IndexableField>,
+            field: &dyn IndexableField,
             gte: bool,
         ) -> Result<Set<IndexEntry>> {
             match trees.get(field.key()) {
@@ -635,7 +698,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
         fn lt_lte(
             trees: &FxHashMap<CompactString, sled::Tree>,
-            field: &Box<dyn IndexableField>,
+            field: &dyn IndexableField,
             lte: bool,
         ) -> Result<Set<IndexEntry>> {
             match trees.get(field.key()) {
@@ -674,7 +737,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
         fn eq(
             trees: &FxHashMap<CompactString, sled::Tree>,
-            field: &Box<dyn IndexableField>,
+            field: &dyn IndexableField,
         ) -> Result<Set<IndexEntry>> {
             let mut set = Set::new();
             match trees.get(field.key()) {
@@ -690,7 +753,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
         fn all_for_key(
             trees: &FxHashMap<CompactString, sled::Tree>,
-            field: &Box<dyn IndexableField>,
+            field: &dyn IndexableField,
         ) -> Result<Set<IndexEntry>> {
             match trees.get(field.key()) {
                 None => Ok(Set::new()),
@@ -715,11 +778,11 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             Ok(set)
         }
         match query {
-            Query::Eq(field) => eq(&self.trees, field),
-            Query::Gt(field) => gt_gte(&self.trees, field, false),
-            Query::Gte(field) => gt_gte(&self.trees, field, true),
-            Query::Lt(field) => lt_lte(&self.trees, field, false),
-            Query::Lte(field) => lt_lte(&self.trees, field, true),
+            Query::Eq(field) => eq(&self.trees, &**field),
+            Query::Gt(field) => gt_gte(&self.trees, &**field, false),
+            Query::Gte(field) => gt_gte(&self.trees, &**field, true),
+            Query::Lt(field) => lt_lte(&self.trees, &**field, false),
+            Query::Lte(field) => lt_lte(&self.trees, &**field, true),
             Query::And(qs) => Ok(qs
                 .iter()
                 .map(|q| self.query(q))
@@ -738,14 +801,14 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
                 .fold(Set::new(), |acc, s| acc.union(&s))),
             Query::Not(q) => match &**q {
                 Query::Eq(field) => {
-                    let matches = eq(&self.trees, field)?;
-                    let all = all_for_key(&self.trees, field)?;
+                    let matches = eq(&self.trees, &**field)?;
+                    let all = all_for_key(&self.trees, &**field)?;
                     Ok(all.diff(&matches))
                 }
-                Query::Gt(field) => lt_lte(&self.trees, field, true),
-                Query::Gte(field) => lt_lte(&self.trees, field, false),
-                Query::Lt(field) => gt_gte(&self.trees, field, true),
-                Query::Lte(field) => gt_gte(&self.trees, field, false),
+                Query::Gt(field) => lt_lte(&self.trees, &**field, true),
+                Query::Gte(field) => lt_lte(&self.trees, &**field, false),
+                Query::Lt(field) => gt_gte(&self.trees, &**field, true),
+                Query::Lte(field) => gt_gte(&self.trees, &**field, false),
                 q @ Query::And(_) | q @ Query::Or(_) | q @ Query::Not(_) => {
                     let matches = self.query(q)?;
                     Ok(all(&self.trees)?.diff(&matches))

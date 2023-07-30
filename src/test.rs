@@ -1,9 +1,13 @@
+use crate::parser::LeafFn;
+
 use super::*;
+use netidx_core::utils;
 use rand::{thread_rng, Rng};
 use serde_derive::{Deserialize, Serialize};
 use std::{
     ops::Deref,
     sync::atomic::{AtomicUsize, Ordering as MemOrdering},
+    fmt::Display,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -15,6 +19,12 @@ impl Deref for Count {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Display for Count {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	write!(f, "{}", self.0)
     }
 }
 
@@ -48,6 +58,12 @@ impl Deref for Index {
     }
 }
 
+impl Display for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	write!(f, "{}", self.0)
+    }
+}
+
 impl IndexableField for Index {
     fn byte_compareable(&self) -> bool {
         true
@@ -75,6 +91,12 @@ impl Deref for Time {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Display for Time {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	write!(f, "{}", self.0)
     }
 }
 
@@ -112,6 +134,12 @@ impl Deref for Id {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	write!(f, "\"{}\"", utils::escape(&self.0, '\\', &['"']))
     }
 }
 
@@ -238,7 +266,7 @@ struct Model {
 }
 
 impl Model {
-    fn eq(&self, field: &Box<dyn IndexableField>) -> Set<usize> {
+    fn eq(&self, field: &dyn IndexableField) -> Set<usize> {
         let mut res = Set::new();
         if let Some(time) = field.as_any().downcast_ref::<Time>() {
             res = self.by_time.get(time).cloned().unwrap_or(Set::new());
@@ -255,7 +283,7 @@ impl Model {
         res
     }
 
-    fn gt_gte(&self, gte: bool, field: &Box<dyn IndexableField>) -> Set<usize> {
+    fn gt_gte(&self, gte: bool, field: &dyn IndexableField) -> Set<usize> {
         fn gt_gte<T: Ord + Eq>(tbl: &BTreeMap<T, Set<usize>>, gte: bool, t: &T) -> Set<usize> {
             let mut res = Set::new();
             for (k, v) in tbl.range(t..) {
@@ -281,7 +309,7 @@ impl Model {
         res
     }
 
-    fn lt_lte(&self, lte: bool, field: &Box<dyn IndexableField>) -> Set<usize> {
+    fn lt_lte(&self, lte: bool, field: &dyn IndexableField) -> Set<usize> {
         fn lt_lte<T: Ord + Eq>(tbl: &BTreeMap<T, Set<usize>>, lte: bool, t: &T) -> Set<usize> {
             let mut res = Set::new();
             for (k, v) in tbl.range(..=t) {
@@ -337,11 +365,11 @@ impl Model {
 
     fn query(&self, q: &Query) -> Set<usize> {
         match q {
-            Query::Eq(f) => self.eq(f),
-            Query::Gt(f) => self.gt_gte(false, f),
-            Query::Gte(f) => self.gt_gte(true, f),
-            Query::Lt(f) => self.lt_lte(false, f),
-            Query::Lte(f) => self.lt_lte(true, f),
+            Query::Eq(f) => self.eq(&**f),
+            Query::Gt(f) => self.gt_gte(false, &**f),
+            Query::Gte(f) => self.gt_gte(true, &**f),
+            Query::Lt(f) => self.lt_lte(false, &**f),
+            Query::Lte(f) => self.lt_lte(true, &**f),
             Query::And(qs) => qs
                 .iter()
                 .map(|q| self.query(q))
@@ -355,11 +383,11 @@ impl Model {
                 .map(|q| self.query(q))
                 .fold(Set::new(), |acc, s| acc.union(&s)),
             Query::Not(q) => match &**q {
-                Query::Eq(f) => self.all_for_key(f.key()).diff(&self.eq(f)),
-                Query::Gt(f) => self.lt_lte(true, f),
-                Query::Gte(f) => self.lt_lte(false, f),
-                Query::Lt(f) => self.gt_gte(true, f),
-                Query::Lte(f) => self.gt_gte(false, f),
+                Query::Eq(f) => self.all_for_key(f.key()).diff(&self.eq(&**f)),
+                Query::Gt(f) => self.lt_lte(true, &**f),
+                Query::Gte(f) => self.lt_lte(false, &**f),
+                Query::Lt(f) => self.gt_gte(true, &**f),
+                Query::Lte(f) => self.gt_gte(false, &**f),
                 q @ Query::And(_) | q @ Query::Or(_) | q @ Query::Not(_) => {
                     self.all().diff(&self.query(q))
                 }
@@ -375,7 +403,7 @@ impl Model {
             by_index: BTreeMap::new(),
             by_id: BTreeMap::new(),
         };
-	model.records.extend(iter);
+        model.records.extend(iter);
         model.records.sort_by_key(|r| r.timestamp());
         for (i, r) in model.records.iter().enumerate() {
             match r {
@@ -410,11 +438,11 @@ impl Model {
                 }
             }
         }
-	model
+        model
     }
 
     fn generate(n: usize) -> Model {
-	Self::new((0..n).into_iter().map(|_| TestRec::gen()))
+        Self::new((0..n).into_iter().map(|_| TestRec::gen()))
     }
 }
 
@@ -512,24 +540,24 @@ async fn test_query_gen(q: impl Fn(&TestRec) -> Query) {
     }
 }
 
-async fn test_single_query_gen(f: impl Fn(Box<dyn IndexableField>) -> Query) {
+async fn test_single_query_gen(f: impl Fn(Arc<dyn IndexableField>) -> Query) {
     test_query_gen(|r| match r {
         TestRec::Bar(b) => {
-	    if thread_rng().gen_bool(0.5) {
-		f(Box::new(b.id.clone()))
-	    } else {
-		f(Box::new(b.time))
-	    }
-	},
+            if thread_rng().gen_bool(0.5) {
+                f(Arc::new(b.id.clone()))
+            } else {
+                f(Arc::new(b.time))
+            }
+        }
         TestRec::Foo(b) => {
-	    if thread_rng().gen_bool(0.33) {
-		f(Box::new(b.count))
-	    } else if thread_rng().gen_bool(0.33) {
-		f(Box::new(b.index))
-	    } else {
-		f(Box::new(b.time))
-	    }
-	},
+            if thread_rng().gen_bool(0.33) {
+                f(Arc::new(b.count))
+            } else if thread_rng().gen_bool(0.33) {
+                f(Arc::new(b.index))
+            } else {
+                f(Arc::new(b.time))
+            }
+        }
     })
     .await
 }
@@ -563,13 +591,13 @@ async fn test_query_gte() {
 async fn test_query_and() {
     test_query_gen(|r| match r {
         TestRec::Bar(b) => Query::And(vec![
-            Query::Eq(Box::new(b.time)),
-            Query::Gte(Box::new(b.id.clone())),
+            Query::Eq(Arc::new(b.time)),
+            Query::Gte(Arc::new(b.id.clone())),
         ]),
         TestRec::Foo(f) => Query::And(vec![
-            Query::Lte(Box::new(f.count)),
-            Query::Eq(Box::new(f.time)),
-            Query::Eq(Box::new(f.index)),
+            Query::Lte(Arc::new(f.count)),
+            Query::Eq(Arc::new(f.time)),
+            Query::Eq(Arc::new(f.index)),
         ]),
     })
     .await
@@ -579,13 +607,13 @@ async fn test_query_and() {
 async fn test_query_or() {
     test_query_gen(|r| match r {
         TestRec::Bar(b) => dbg!(Query::Or(vec![
-            Query::Lt(Box::new(b.time)),
-            Query::Eq(Box::new(b.id.clone())),
+            Query::Lt(Arc::new(b.time)),
+            Query::Eq(Arc::new(b.id.clone())),
         ])),
         TestRec::Foo(f) => dbg!(Query::Or(vec![
-	    Query::Lt(Box::new(f.time)),
-            Query::Eq(Box::new(f.count)),
-            Query::Eq(Box::new(f.index)),
+            Query::Lt(Arc::new(f.time)),
+            Query::Eq(Arc::new(f.count)),
+            Query::Eq(Arc::new(f.index)),
         ])),
     })
     .await
@@ -596,14 +624,19 @@ async fn test_reindex() {
     use std::{fs::OpenOptions, io::Write};
     let (db, mut model) = init_and_append(100_000).await.unwrap();
     let path = PathBuf::from(db.path());
-    let file = path.read_dir().unwrap().filter_map(|e| {
-	let e = e.unwrap();
-	if e.file_type().unwrap().is_file() {
-	    Some(e.path())
-	} else {
-	    None
-	}
-    }).next().unwrap();
+    let file = path
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_file() {
+                Some(e.path())
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap();
     let new_t = TestRec::gen();
     let mut fd = OpenOptions::new().append(true).open(&file).unwrap();
     serde_json::to_writer(&mut fd, &new_t).unwrap();
@@ -616,8 +649,8 @@ async fn test_reindex() {
     // should detect that a file is modified and reindex the archive
     let mut db = IndexedJson::open(&path).await.unwrap();
     let q = match &new_t {
-	TestRec::Bar(b) => dbg!(Query::Eq(Box::new(b.id.clone()))),
-	TestRec::Foo(f) => dbg!(Query::Eq(Box::new(f.time)))
+        TestRec::Bar(b) => dbg!(Query::Eq(Arc::new(b.id.clone()))),
+        TestRec::Foo(f) => dbg!(Query::Eq(Arc::new(f.time))),
     };
     let (model_res, db_res) = exec_query(&model, &mut db, &q).await;
     if !model_res
@@ -627,4 +660,33 @@ async fn test_reindex() {
     {
         panic!("{:?} differs from {:?}", model_res, db_res)
     }
+}
+
+#[test]
+fn test_parser() {
+    fn test(s: &str) {
+	let count: LeafFn = Box::new(|s| Ok(Arc::new(Count(s.parse()?))));
+	let index: LeafFn = Box::new(|s: &str| Ok(Arc::new(Index(s.parse()?))));
+	let time: LeafFn = Box::new(|s: &str| Ok(Arc::new(Time(s.parse()?))));
+	let id: LeafFn = Box::new(|s: &str| Ok(Arc::new(Id(CompactString::from(s)))));
+	let leaftbl = HashMap::from_iter([
+            ("count", count),
+            ("index", index),
+            ("time", time),
+            ("id", id),
+	]);
+	dbg!(s);
+	let q = parser::parse_query(&leaftbl, s).unwrap();
+	dbg!(&q);
+	assert_eq!(&format!("{}", q), s)
+    }
+    test("count == 127");
+    test("index > 3");
+    test(r#"id == "\"hello world\"""#);
+    test("count < 4");
+    test("count <= 4");
+    test("count >= 3");
+    test("index != 42");
+    test("!count >= 42");
+    test(r#"(count > 42 && (index > 4 || id == "hello world") && count < 125)"#);
 }
