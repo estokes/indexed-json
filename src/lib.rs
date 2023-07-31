@@ -48,7 +48,8 @@ use std::{
     io::SeekFrom,
     marker::PhantomData,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH, sync::Arc,
+    sync::Arc,
+    time::UNIX_EPOCH,
 };
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -56,9 +57,9 @@ use tokio::{
     task,
 };
 
+pub mod parser;
 #[cfg(test)]
 mod test;
-pub mod parser;
 
 /// A query against the index
 #[derive(Debug, Clone)]
@@ -75,54 +76,54 @@ pub enum Query {
 
 impl Display for Query {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-	use Query::*;
-	match self {
-	    Eq(i) => write!(f, "{} == {}", i.key(), i),
-	    Gt(i) => write!(f, "{} > {}", i.key(), i),
-	    Gte(i) => write!(f, "{} >= {}", i.key(), i),
-	    Lt(i) => write!(f, "{} < {}", i.key(), i),
-	    Lte(i) => write!(f, "{} <= {}", i.key(), i),
-	    Not(i) => match &**i {
-		Eq(i) => write!(f, "{} != {}", i.key(), i),
-		q => write!(f, "!{}", q)
-	    }
-	    And(qs) => {
-		let len = qs.len();
-		if len == 0 {
-		    Ok(())
-		} else if len == 1 {
-		    write!(f, "{}", &qs[0])
-		} else {
-		    write!(f, "(")?;
-		    for (i, q) in qs.iter().enumerate() {
-			if i < len - 1 {
-			    write!(f, "{} && ", q)?
-			} else {
-			    write!(f, "{}", q)?
-			}
-		    }
-		    write!(f, ")")
-		}
-	    }
-	    Or(qs) => {
-		let len = qs.len();
-		if len == 0 {
-		    Ok(())
-		} else if len == 1 {
-		    write!(f, "{}", &qs[0])
-		} else {
-		    write!(f, "(")?;
-		    for (i, q) in qs.iter().enumerate() {
-			if i < len - 1 {
-			    write!(f, "{} || ", q)?
-			} else {
-			    write!(f, "{}", q)?
-			}
-		    }
-		    write!(f, ")")
-		}
-	    }
-	}
+        use Query::*;
+        match self {
+            Eq(i) => write!(f, "{} == {}", i.key(), i),
+            Gt(i) => write!(f, "{} > {}", i.key(), i),
+            Gte(i) => write!(f, "{} >= {}", i.key(), i),
+            Lt(i) => write!(f, "{} < {}", i.key(), i),
+            Lte(i) => write!(f, "{} <= {}", i.key(), i),
+            Not(i) => match &**i {
+                Eq(i) => write!(f, "{} != {}", i.key(), i),
+                q => write!(f, "!{}", q),
+            },
+            And(qs) => {
+                let len = qs.len();
+                if len == 0 {
+                    Ok(())
+                } else if len == 1 {
+                    write!(f, "{}", &qs[0])
+                } else {
+                    write!(f, "(")?;
+                    for (i, q) in qs.iter().enumerate() {
+                        if i < len - 1 {
+                            write!(f, "{} && ", q)?
+                        } else {
+                            write!(f, "{}", q)?
+                        }
+                    }
+                    write!(f, ")")
+                }
+            }
+            Or(qs) => {
+                let len = qs.len();
+                if len == 0 {
+                    Ok(())
+                } else if len == 1 {
+                    write!(f, "{}", &qs[0])
+                } else {
+                    write!(f, "(")?;
+                    for (i, q) in qs.iter().enumerate() {
+                        if i < len - 1 {
+                            write!(f, "{} || ", q)?
+                        } else {
+                            write!(f, "{}", q)?
+                        }
+                    }
+                    write!(f, ")")
+                }
+            }
+        }
     }
 }
 
@@ -130,7 +131,7 @@ impl Query {
     /// Given a table of key -> constructor functions for leaf nodes,
     /// parse the specified string as a query and return it.
     pub fn parse(leaf: &LeafTbl, s: &str) -> Result<Query> {
-	parser::parse_query(leaf, s)
+        parser::parse_query(leaf, s)
     }
 }
 
@@ -343,9 +344,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// Open an existing indexed json archive, or create a new one. If
     /// the index is missing or outdated then it will be rebuilt.
     pub async fn open(base: impl AsRef<Path>) -> Result<Self> {
-	if !base.as_ref().exists() {
-	    fs::create_dir_all(&base).await?;
-	}
+        if !base.as_ref().exists() {
+            fs::create_dir_all(&base).await?;
+        }
         if !fs::metadata(&base).await?.is_dir() {
             bail!("{:?} is not a directory", base.as_ref())
         }
@@ -381,9 +382,9 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
 
     /// the base path of the archive
     pub fn path(&self) -> &Path {
-	&self.base
+        &self.base
     }
-    
+
     // note this will close all open files as well as add any new
     // files that have appeared on disk to the database.
     async fn rescan_files(&mut self) -> Result<()> {
