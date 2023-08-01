@@ -133,6 +133,35 @@ impl Query {
     pub fn parse(leaf: &LeafTbl, s: &str) -> Result<Query> {
         parser::parse_query(leaf, s)
     }
+
+    /// return true if T matches
+    pub fn matches<T: Indexable>(&self, t: &T) -> bool {
+	match self {
+	    Self::Eq(i) => match t.dyn_partial_cmp(&**i) {
+		Some(Ordering::Equal) => true,
+		None | Some(Ordering::Greater | Ordering::Less) => false
+	    }
+	    Self::Gt(i) => match t.dyn_partial_cmp(&**i) {
+		Some(Ordering::Greater) => true,
+		None | Some(Ordering::Equal | Ordering::Less) => false
+	    }
+	    Self::Gte(i) => match t.dyn_partial_cmp(&**i) {
+		Some(Ordering::Greater | Ordering::Equal) => true,
+		None | Some(Ordering::Less) => false,
+	    }
+	    Self::Lt(i) => match t.dyn_partial_cmp(&**i) {
+		Some(Ordering::Less) => true,
+		None | Some(Ordering::Equal | Ordering::Greater) => false,
+	    }
+	    Self::Lte(i) => match t.dyn_partial_cmp(&**i) {
+		Some(Ordering::Less | Ordering::Equal) => true,
+		None | Some(Ordering::Greater) => false,
+	    }
+	    Self::And(qs) => qs.iter().all(|q| q.matches(t)),
+	    Self::Or(qs) => qs.iter().any(|q| q.matches(t)),
+	    Self::Not(q) => !q.matches(t)
+	}
+    }
 }
 
 /// An indexable field. Indexable fields must be byte equal, meaning
@@ -183,6 +212,10 @@ pub trait Indexable {
     /// for every record then there will just be one file and
     /// everything else will work fine.
     fn timestamp(&self) -> DateTime<Utc>;
+
+    /// given an indexable field object return an ordering if the
+    /// field is relevant to this record
+    fn dyn_partial_cmp(&self, i: &dyn IndexableField) -> Option<Ordering>;
 }
 
 fn min_key_with_prefix(index: &sled::Tree, k: &[u8]) -> Result<Option<IVec>> {
@@ -338,6 +371,7 @@ pub struct IndexedJson<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     trees: FxHashMap<CompactString, sled::Tree>,
     files: BTreeMap<NaiveDate, JsonFile<T>>,
     gc: DateTime<Utc>,
+    dirty: bool,
 }
 
 impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
@@ -375,6 +409,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             trees: HashMap::default(),
             files,
             gc: Utc::now(),
+	    dirty: false,
         };
         t.maybe_reindex().await?;
         Ok(t)
@@ -552,27 +587,30 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// should call this at the end of each batch to make sure your
     /// changes are flushed to disk.
     pub async fn flush(&mut self) -> Result<()> {
-        future::join_all(self.files.values_mut().map(|f| f.flush()))
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        task::spawn_blocking({
-            let db = self.db.clone();
-            move || db.flush()
-        })
-        .await??;
-        task::spawn_blocking({
-            let db = self.index_status.clone();
-            move || db.flush()
-        })
-        .await??;
-        for tree in self.trees.values() {
+	if self.dirty {
+            future::join_all(self.files.values_mut().map(|f| f.flush()))
+		.await
+		.into_iter()
+		.collect::<Result<Vec<_>>>()?;
             task::spawn_blocking({
-                let db = tree.clone();
-                move || db.flush()
+		let db = self.db.clone();
+		move || db.flush()
             })
-            .await??;
-        }
+		.await??;
+            task::spawn_blocking({
+		let db = self.index_status.clone();
+		move || db.flush()
+            })
+		.await??;
+            for tree in self.trees.values() {
+		task::spawn_blocking({
+                    let db = tree.clone();
+                    move || db.flush()
+		})
+		    .await??;
+            }
+	    self.dirty = false;
+	}
         Ok(())
     }
 
@@ -595,6 +633,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             record,
         )?;
         file.update_mtime(&self.index_status).await?;
+	self.dirty = true;
         Ok(self.maybe_gc())
     }
 
