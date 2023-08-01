@@ -292,6 +292,32 @@ impl Indexable for TestRec {
             TestRec::Bar(b) => *b.time,
         }
     }
+
+    fn dyn_partial_cmp(&self, i: &dyn IndexableField) -> Option<Ordering> {
+	match self {
+	    TestRec::Foo(f) => {
+		if let Some(time) = i.as_any().downcast_ref::<Time>() {
+		    return Some(f.time.cmp(time))
+		}
+		if let Some(count) = i.as_any().downcast_ref::<Count>() {
+		    return Some(f.count.cmp(count))
+		}
+		if let Some(index) = i.as_any().downcast_ref::<Index>() {
+		    return Some(f.index.cmp(index))
+		}
+		None
+	    }
+	    TestRec::Bar(b) => {
+		if let Some(time) = i.as_any().downcast_ref::<Time>() {
+		    return Some(b.time.cmp(time))
+		}
+		if let Some(id) = i.as_any().downcast_ref::<Id>() {
+		    return Some(b.id.cmp(id))
+		}
+		None
+	    }
+	}
+    }
 }
 
 struct Model {
