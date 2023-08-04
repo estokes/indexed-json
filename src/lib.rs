@@ -136,31 +136,31 @@ impl Query {
 
     /// return true if T matches
     pub fn matches<T: Indexable>(&self, t: &T) -> bool {
-	match self {
-	    Self::Eq(i) => match t.dyn_partial_cmp(&**i) {
-		Some(Ordering::Equal) => true,
-		None | Some(Ordering::Greater | Ordering::Less) => false
-	    }
-	    Self::Gt(i) => match t.dyn_partial_cmp(&**i) {
-		Some(Ordering::Greater) => true,
-		None | Some(Ordering::Equal | Ordering::Less) => false
-	    }
-	    Self::Gte(i) => match t.dyn_partial_cmp(&**i) {
-		Some(Ordering::Greater | Ordering::Equal) => true,
-		None | Some(Ordering::Less) => false,
-	    }
-	    Self::Lt(i) => match t.dyn_partial_cmp(&**i) {
-		Some(Ordering::Less) => true,
-		None | Some(Ordering::Equal | Ordering::Greater) => false,
-	    }
-	    Self::Lte(i) => match t.dyn_partial_cmp(&**i) {
-		Some(Ordering::Less | Ordering::Equal) => true,
-		None | Some(Ordering::Greater) => false,
-	    }
-	    Self::And(qs) => qs.iter().all(|q| q.matches(t)),
-	    Self::Or(qs) => qs.iter().any(|q| q.matches(t)),
-	    Self::Not(q) => !q.matches(t)
-	}
+        match self {
+            Self::Eq(i) => match t.dyn_partial_cmp(&**i) {
+                Some(Ordering::Equal) => true,
+                None | Some(Ordering::Greater | Ordering::Less) => false,
+            },
+            Self::Gt(i) => match t.dyn_partial_cmp(&**i) {
+                Some(Ordering::Greater) => true,
+                None | Some(Ordering::Equal | Ordering::Less) => false,
+            },
+            Self::Gte(i) => match t.dyn_partial_cmp(&**i) {
+                Some(Ordering::Greater | Ordering::Equal) => true,
+                None | Some(Ordering::Less) => false,
+            },
+            Self::Lt(i) => match t.dyn_partial_cmp(&**i) {
+                Some(Ordering::Less) => true,
+                None | Some(Ordering::Equal | Ordering::Greater) => false,
+            },
+            Self::Lte(i) => match t.dyn_partial_cmp(&**i) {
+                Some(Ordering::Less | Ordering::Equal) => true,
+                None | Some(Ordering::Greater) => false,
+            },
+            Self::And(qs) => qs.iter().all(|q| q.matches(t)),
+            Self::Or(qs) => qs.iter().any(|q| q.matches(t)),
+            Self::Not(q) => !q.matches(t),
+        }
     }
 }
 
@@ -238,6 +238,7 @@ pub struct IndexEntry {
     pub offset: u64,
 }
 
+#[derive(Debug)]
 struct JsonFile<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     phantom: PhantomData<T>,
     last_used: DateTime<Utc>,
@@ -374,7 +375,7 @@ pub struct IndexedJson<T: Indexable + Serialize + for<'a> Deserialize<'a>> {
     dirty: bool,
 }
 
-impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
+impl<T: Debug + Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// Open an existing indexed json archive, or create a new one. If
     /// the index is missing or outdated then it will be rebuilt.
     pub async fn open(base: impl AsRef<Path>) -> Result<Self> {
@@ -386,13 +387,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
         }
         let db = task::spawn_blocking({
             let path = base.as_ref().join("db");
-            move || {
-                sled::Config::new()
-                    .mode(sled::Mode::LowSpace)
-                    .flush_every_ms(None)
-                    .path(path)
-                    .open()
-            }
+            move || sled::Config::new().flush_every_ms(None).path(path).open()
         })
         .await??;
         let index_status = task::spawn_blocking({
@@ -409,7 +404,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             trees: HashMap::default(),
             files,
             gc: Utc::now(),
-	    dirty: false,
+            dirty: false,
         };
         t.maybe_reindex().await?;
         Ok(t)
@@ -532,6 +527,8 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             }
             f.update_mtime(&self.index_status).await?
         }
+        self.dirty = true;
+        self.flush().await?;
         Ok(())
     }
 
@@ -587,30 +584,33 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
     /// should call this at the end of each batch to make sure your
     /// changes are flushed to disk.
     pub async fn flush(&mut self) -> Result<()> {
-	if self.dirty {
-            future::join_all(self.files.values_mut().map(|f| f.flush()))
-		.await
-		.into_iter()
-		.collect::<Result<Vec<_>>>()?;
+        if self.dirty {
+            future::join_all(self.files.values_mut().map(|f| async {
+                f.flush().await?;
+                f.update_mtime(&self.index_status).await
+            }))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
             task::spawn_blocking({
-		let db = self.db.clone();
-		move || db.flush()
+                let db = self.db.clone();
+                move || db.flush()
             })
-		.await??;
+            .await??;
             task::spawn_blocking({
-		let db = self.index_status.clone();
-		move || db.flush()
+                let db = self.index_status.clone();
+                move || db.flush()
             })
-		.await??;
+            .await??;
             for tree in self.trees.values() {
-		task::spawn_blocking({
+                task::spawn_blocking({
                     let db = tree.clone();
                     move || db.flush()
-		})
-		    .await??;
+                })
+                .await??;
             }
-	    self.dirty = false;
-	}
+            self.dirty = false;
+        }
         Ok(())
     }
 
@@ -632,8 +632,7 @@ impl<T: Indexable + Serialize + for<'a> Deserialize<'a>> IndexedJson<T> {
             },
             record,
         )?;
-        file.update_mtime(&self.index_status).await?;
-	self.dirty = true;
+        self.dirty = true;
         Ok(self.maybe_gc())
     }
 
